@@ -977,12 +977,14 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--opd-type",
                 type=str,
-                choices=["sglang", "megatron"],
+                choices=["sglang", "megatron", "opsd"],
                 default=None,
                 help=(
                     "Type of on-policy distillation. "
                     "'sglang': Teacher log-probs are obtained from external SGLang server during rollout. "
-                    "'megatron': Teacher model is loaded via --opd-teacher-load and forwarded during training."
+                    "'megatron': Teacher model is loaded via --opd-teacher-load and forwarded during training. "
+                    "'opsd': On-Policy Self-Distillation — same model acts as teacher with privileged prompt, "
+                    "using full-vocabulary JSD loss. Teacher tokens are constructed during rollout."
                 ),
             )
             parser.add_argument(
@@ -1002,6 +1004,25 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
             parser.add_argument(
                 "--opd-teacher-ckpt-step", type=int, default=None, help="The checkpoint step for OPD teacher model."
+            )
+            # OPSD-specific arguments
+            parser.add_argument(
+                "--opsd-jsd-coef",
+                type=float,
+                default=0.0,
+                help="Coefficient for full-vocabulary JSD loss in OPSD mode. Default is 0.0 (disabled).",
+            )
+            parser.add_argument(
+                "--opsd-jsd-beta",
+                type=float,
+                default=0.5,
+                help="Interpolation weight for JSD mixture distribution: m = beta*p_T + (1-beta)*p_S. Default 0.5.",
+            )
+            parser.add_argument(
+                "--opsd-pure-mode",
+                action="store_true",
+                default=False,
+                help="When enabled, OPSD uses only JSD loss without RL policy gradient (pg_loss is zeroed out).",
             )
             return parser
 
@@ -1582,6 +1603,17 @@ def slime_validate_args(args):
                     "--opd-teacher-load should not be set when --opd-type=sglang. "
                     "In sglang mode, teacher log-probs are obtained from external server during rollout."
                 )
+
+        elif args.opd_type == "opsd":
+            if args.opd_teacher_load is not None:
+                raise ValueError(
+                    "--opd-teacher-load should not be set when --opd-type=opsd. "
+                    "In OPSD mode, the same model acts as teacher with privileged prompts."
+                )
+            if args.pipeline_model_parallel_size > 1:
+                raise ValueError("OPSD requires --pipeline-model-parallel-size 1.")
+            if args.context_parallel_size > 1:
+                raise ValueError("OPSD requires --context-parallel-size 1.")
     else:
         # If OPD is not enabled, opd_teacher_load should not be set
         if args.opd_teacher_load is not None:

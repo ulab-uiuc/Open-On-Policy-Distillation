@@ -492,7 +492,8 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
         raise NotImplementedError(f"advantage_estimator {args.advantage_estimator} is not supported. ")
 
     # Apply on-policy distillation KL penalty to advantages (orthogonal to advantage estimator)
-    if args.use_opd:
+    # Skip for opsd: OPSD computes full-vocabulary JSD in the forward pass, not via log-prob KL on advantages.
+    if args.use_opd and getattr(args, "opd_type", None) != "opsd":
         apply_opd_kl_to_advantages(
             args=args,
             rollout_data=rollout_data,
@@ -770,7 +771,17 @@ def policy_loss_function(
     entropy = torch.cat(entropy, dim=0)
     entropy_loss = sum_of_sample_mean(entropy)
 
-    loss = pg_loss - args.entropy_coef * entropy_loss
+    # OPSD: optionally zero out pg_loss in pure mode (JSD-only training)
+    if getattr(args, "opsd_pure_mode", False) and args.use_opd and args.opd_type == "opsd":
+        loss = torch.zeros_like(pg_loss) - args.entropy_coef * entropy_loss
+    else:
+        loss = pg_loss - args.entropy_coef * entropy_loss
+
+    # OPSD: add JSD loss
+    if args.use_opd and args.opd_type == "opsd" and args.opsd_jsd_coef > 0 and "opsd_jsd_values" in batch:
+        opsd_jsd = torch.cat(batch["opsd_jsd_values"], dim=0)
+        opsd_jsd_loss = sum_of_sample_mean(opsd_jsd)
+        loss = loss + args.opsd_jsd_coef * opsd_jsd_loss
 
     if args.use_kl_loss:
         ref_log_probs = batch["ref_log_probs"]
@@ -827,6 +838,11 @@ def policy_loss_function(
     if "opd_reverse_kl" in batch:
         opd_reverse_kl = torch.cat(batch["opd_reverse_kl"], dim=0)
         reported_loss["opd_reverse_kl"] = sum_of_sample_mean(opd_reverse_kl).clone().detach()
+
+    # Add OPSD JSD metrics if available
+    if "opsd_jsd_values" in batch:
+        opsd_jsd = torch.cat(batch["opsd_jsd_values"], dim=0)
+        reported_loss["opsd_jsd"] = sum_of_sample_mean(opsd_jsd).clone().detach()
 
     return loss, reported_loss
 

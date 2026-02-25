@@ -580,6 +580,12 @@ class RolloutManager:
         if samples[0].teacher_log_probs is not None:
             train_data["teacher_log_probs"] = [sample.teacher_log_probs for sample in samples]
 
+        # OPSD: pack teacher tokens and teacher prompt lengths
+        if getattr(samples[0], "teacher_tokens", None) is not None:
+            train_data["teacher_tokens"] = [sample.teacher_tokens for sample in samples]
+        if getattr(samples[0], "teacher_prompt_length", None) is not None:
+            train_data["teacher_prompt_lengths"] = [sample.teacher_prompt_length for sample in samples]
+
         return train_data
 
     def set_train_parallel_config(self, config: dict):
@@ -619,6 +625,8 @@ class RolloutManager:
                 "rollout_routed_experts",
                 "prompt",
                 "teacher_log_probs",
+                "teacher_tokens",
+                "teacher_prompt_lengths",
             ]:
                 if key not in data:
                     continue

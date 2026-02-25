@@ -246,6 +246,14 @@ class MegatronTrainRayActor(TrainRayActor):
             rollout_data["rollout_routed_experts"] = [
                 torch.from_numpy(r) for r in rollout_data["rollout_routed_experts"]
             ]
+
+        # OPSD: move teacher tokens to GPU
+        if "teacher_tokens" in rollout_data:
+            rollout_data["teacher_tokens"] = [
+                torch.tensor(t, dtype=torch.long, device=torch.cuda.current_device())
+                for t in rollout_data["teacher_tokens"]
+            ]
+
         return rollout_data
 
     def _switch_model(self, target_tag: str) -> None:
