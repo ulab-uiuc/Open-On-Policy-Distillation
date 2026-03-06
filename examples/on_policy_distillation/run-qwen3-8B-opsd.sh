@@ -30,7 +30,7 @@ else
 fi
 echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
-source "/root/slime/scripts/models/qwen3-8B.sh"
+source "/root/slime_siqi/scripts/models/qwen3-8B.sh"
 
 ###############################################################################
 # Step 0: Convert parquet files to JSONL (train_chat.jsonl & test_chat.jsonl)
@@ -39,7 +39,7 @@ source "/root/slime/scripts/models/qwen3-8B.sh"
 python3 -c "
 import json, os, pathlib, sys
 
-DATA_DIR = '/root/math/data'
+DATA_DIR = '/root/math'
 
 # ---- check for pyarrow ----
 try:
@@ -50,7 +50,14 @@ except ImportError:
     pq = None
 
 # ---- find parquet files ----
-parquet_files = sorted(f for f in os.listdir(DATA_DIR) if f.endswith('.parquet'))
+parquet_files = []
+
+# 🔥 递归搜索
+for root, dirs, files in os.walk(DATA_DIR):
+    for f in files:
+        if f.endswith('.parquet'):
+            parquet_files.append(os.path.join(root, f))
+
 if not parquet_files:
     print(f'No parquet files in {DATA_DIR}, skipping conversion.')
     sys.exit(0)
@@ -204,7 +211,7 @@ EVAL_ARGS=(
 )
 
 PERF_ARGS=(
-   --tensor-model-parallel-size 4
+   --tensor-model-parallel-size 2
    --sequence-parallel
    --pipeline-model-parallel-size 1
    --context-parallel-size 1
@@ -246,7 +253,7 @@ WANDB_ARGS=(
    --use-wandb
    --wandb-project slime-dev
    --wandb-group qwen3-8B-opsd-jsd
-   --wandb-key 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
+   --wandb-key 2ed6f8544ac3e30d5c08879166cc10d9c6232448
 )
 
 SGLANG_ARGS=(
@@ -270,8 +277,8 @@ echo "Starting Ray job..."
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 unset RAY_ADDRESS
 ray stop --force || true
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5
-ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 6 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
+export CUDA_VISIBLE_DEVICES=6,7,8,9
+ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 4 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
 
 
 set +e
@@ -281,12 +288,12 @@ ray job submit --address="http://127.0.0.1:8265" \
      "env_vars": {
         "PYTHONPATH": "/root/Megatron-LM/",
         "CUDA_DEVICE_MAX_CONNECTIONS": "1",
-        "CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5"
+        "CUDA_VISIBLE_DEVICES": "6,7,8,9"
      }
    }' \
    -- python3 train.py \
    --actor-num-nodes 1 \
-   --actor-num-gpus-per-node 4 \
+   --actor-num-gpus-per-node 2 \
    --rollout-num-gpus 2 \
    ${MODEL_ARGS[@]} \
    ${CKPT_ARGS[@]} \
