@@ -476,8 +476,35 @@ def grade_answer_mathd(given_answer: str, ground_truth: str) -> bool:
 
 
 def extract_answer(passage: str) -> str:
+    """Extract the final answer from a model response.
+
+    Tries two formats in order:
+    1. ``Answer: <value>`` (case-insensitive) — highest priority.
+       \boxed{} is NOT used spontaneously; it only appears when the prompt
+       explicitly requests it.  Meanwhile, thinking-mode models routinely
+       place intermediate \boxed{} expressions inside <think> blocks, so
+       checking \boxed{} first would pick up wrong intermediate values.
+    2. LaTeX ``\\boxed{...}`` — fallback for prompts that explicitly ask for
+       boxed answers and produce no ``Answer:`` line.
+
+    Returns the extracted string, or ``None`` if neither pattern is found.
+    """
+    import re
+
+    # 1. "Answer: ..." on its own line (DAPO / Minerva format) — check first.
+    match = re.findall(r"(?i)Answer\s*:\s*([^\n]+)", passage)
+    if match:
+        ans = match[-1].strip().rstrip(".")
+        # Strip special tokens like <|im_end|>, <|endoftext|>, etc.
+        ans = re.sub(r"<\|[^|]*\|>", "", ans).strip().rstrip(".")
+        # Strip outer LaTeX math delimiters: $8$ → 8, $\frac{1}{2}$ → \frac{1}{2}
+        ans = re.sub(r"^\$(.+)\$$", r"\1", ans).strip()
+        return ans
+
+    # 2. \boxed{} fallback — only reached when the prompt explicitly asks for it.
     if "\\boxed" in passage:
         return extract_boxed_answer(passage)
+
     return None
 
 

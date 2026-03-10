@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # On-Policy Self-Distillation (OPSD) with full-vocabulary JSD loss
-# Usage: bash examples/on_policy_distillation/run-qwen3-8b-opsd.sh
+# Usage: bash examples/on_policy_distillation/run-qwen3-4B-opsd.sh
 #
 # A single Qwen2.5-1.5B model acts as both teacher and student:
 #   - Student: generates on-policy rollouts from the normal prompt
@@ -18,6 +18,7 @@ export NCCL_P2P_DISABLE=1
 export NCCL_IB_DISABLE=1
 export NCCL_NET_GDR_LEVEL=0
 export NCCL_DEBUG=INFO
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 
 export PYTHONBUFFERED=16
@@ -30,7 +31,7 @@ else
 fi
 echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
-source "/root/slime_siqi/scripts/models/qwen3-8B.sh"
+source "/root/slime_siqi/scripts/models/qwen3-4B.sh"
 
 ###############################################################################
 # Step 0: Build JSONL data from HuggingFace datasets
@@ -195,11 +196,10 @@ print(f'Created {dst} with {count} samples (capped at {MAX_EVAL_SAMPLES})')
 ###############################################################################
 
 CKPT_ARGS=(
-   --hf-checkpoint /root/Qwen3-8B
-   --ref-load "/root/Qwen3-8B_torch_dist"
-   --save /root/slime_siqi/output/Qwen3-8B_opsd_slime/
+   --hf-checkpoint /root/Qwen3-4B
+   --ref-load "/root/Qwen3-4B_torch_dist"
+   --save /root/slime/output/Qwen3-4B_opsd_slime/
    --save-interval 2000
-   --ref-update-interval 20
 )
 
 ROLLOUT_ARGS=(
@@ -213,7 +213,7 @@ ROLLOUT_ARGS=(
    --rollout-batch-size 32
    --n-samples-per-prompt 1
    --rollout-max-response-len 1024
-   --rollout-temperature 1.2
+   --rollout-temperature 1.1
    --over-sampling-batch-size 64
 
    --global-batch-size 32
@@ -227,7 +227,7 @@ RM_ARGS=(
 )
 
 EVAL_ARGS=(
-    --eval-interval 20
+    --eval-interval 5
     --eval-config examples/on_policy_distillation/eval_config.yaml
     --log-passrate
 )
@@ -273,7 +273,7 @@ OPTIMIZER_ARGS=(
 WANDB_ARGS=(
    --use-wandb
    --wandb-project slime-dev
-   --wandb-group qwen3-8B-opsd-jsd
+   --wandb-group qwen3-4B-opsd-jsd
    --wandb-key 2ed6f8544ac3e30d5c08879166cc10d9c6232448
 )
 
@@ -288,7 +288,7 @@ MISC_ARGS=(
    --accumulate-allreduce-grads-in-fp32
    --attention-softmax-in-fp32
    --attention-backend flash
-   --log-probs-chunk-size 512
+   --log-probs-chunk-size 256
 )
 
 
@@ -296,10 +296,12 @@ echo "Starting Ray job..."
 
 # launch the master node of ray in container
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
+export RAY_TMPDIR=${RAY_TMPDIR:-"/dev/shm/ray_tmp"}
+mkdir -p "${RAY_TMPDIR}"
 unset RAY_ADDRESS
 ray stop --force || true
 export CUDA_VISIBLE_DEVICES=6,7,8,9
-ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 4 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
+ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 4 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265 --temp-dir "${RAY_TMPDIR}"
 
 
 set +e
@@ -309,7 +311,8 @@ ray job submit --address="http://127.0.0.1:8265" \
      "env_vars": {
         "PYTHONPATH": "/root/Megatron-LM/",
         "CUDA_DEVICE_MAX_CONNECTIONS": "1",
-        "CUDA_VISIBLE_DEVICES": "6,7,8,9"
+        "CUDA_VISIBLE_DEVICES": "6,7,8,9",
+        "RAY_TMPDIR": "/dev/shm/ray_tmp"
      }
    }' \
    -- python3 train.py \

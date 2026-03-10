@@ -1,9 +1,20 @@
+# NOTE: In-training eval shares the same apply_chat_template_kwargs as training rollout.
+# Because rollout uses enable_thinking=false (to match the original opsd_ucla paper config),
+# this in-training eval also runs in NON-THINKING mode and should only be used as a trend indicator.
+#
+# For final benchmark evaluation matching the paper results, use opsd_ucla/eval/evaluate_math.py
+# WITHOUT --no_thinking (default enable_thinking=True, max_new_tokens=38912).
 eval:
   defaults:
-    max_response_len: 2048
-    top_p: 1.0
+    max_response_len: 38912
+    top_p: 0.95
   datasets:
     - name: math_test
-      path: /root/math/data/test_chat_eval.jsonl
+      path: /root/math/data/eval_opsdc.jsonl
       rm_type: math
-      n_samples_per_eval_prompt: 1
+      n_samples_per_eval_prompt: 4
+      # Override global --apply-chat-template-kwargs for eval only.
+      # Set enable_thinking: false to use non-thinking mode (consistent with student rollout),
+      # or remove this key to use the global setting.
+      apply_chat_template_kwargs:
+        enable_thinking: true

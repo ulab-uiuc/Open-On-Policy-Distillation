@@ -719,6 +719,114 @@ def compute_vocab_parallel_jsd(
     return jsd
 
 
+def compute_vocab_parallel_reverse_kl(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    process_group: dist.ProcessGroup | None,
+) -> torch.Tensor:
+    """Compute full-vocabulary Reverse KL divergence: KL(p_S || p_T).
+
+    Reverse KL is mode-seeking: the student tends to concentrate on a subset of
+    the teacher's modes, which can encourage more focused / less hedging outputs.
+
+    KL(p_S || p_T) = sum_v  p_S(v) * log(p_S(v) / p_T(v))
+
+    Each TP rank holds a shard of the vocabulary dimension. Global normalization
+    (softmax) is handled via all-reduce before computing the divergence.
+
+    Args:
+        student_logits: Student model logits, shape [seq_len, V_local].
+        teacher_logits: Teacher model logits, shape [seq_len, V_local].
+        process_group: Tensor-parallel process group for all-reduce.
+
+    Returns:
+        Per-token reverse-KL values, shape [seq_len].
+    """
+    # Numerically-stable global softmax via (logits - max) / sum_exp
+    student_max = student_logits.max(dim=-1, keepdim=True).values
+    teacher_max = teacher_logits.max(dim=-1, keepdim=True).values
+    if process_group is not None:
+        dist.all_reduce(student_max, op=dist.ReduceOp.MAX, group=process_group)
+        dist.all_reduce(teacher_max, op=dist.ReduceOp.MAX, group=process_group)
+
+    student_exp = (student_logits - student_max).exp()
+    teacher_exp = (teacher_logits - teacher_max).exp()
+
+    student_sum_exp = student_exp.sum(dim=-1, keepdim=True)
+    teacher_sum_exp = teacher_exp.sum(dim=-1, keepdim=True)
+    if process_group is not None:
+        dist.all_reduce(student_sum_exp, group=process_group)
+        dist.all_reduce(teacher_sum_exp, group=process_group)
+
+    student_probs = student_exp / student_sum_exp  # [seq_len, V_local]
+    teacher_probs = teacher_exp / teacher_sum_exp  # [seq_len, V_local]
+
+    # KL(p_S || p_T) = sum_v  p_S * (log p_S - log p_T)
+    eps = 1e-10
+    kl_local = student_probs * (
+        student_probs.clamp(min=eps).log() - teacher_probs.clamp(min=eps).log()
+    )
+    kl = kl_local.sum(dim=-1)  # [seq_len]
+    if process_group is not None:
+        dist.all_reduce(kl, group=process_group)
+
+    return kl
+
+
+def compute_vocab_parallel_forward_kl(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    process_group: dist.ProcessGroup | None,
+) -> torch.Tensor:
+    """Compute full-vocabulary Forward KL divergence: KL(p_T || p_S).
+
+    Forward KL is mode-covering: the student is penalised whenever it assigns
+    low probability to tokens the teacher considers likely, so it tends to
+    spread probability mass across all teacher modes.
+
+    KL(p_T || p_S) = sum_v  p_T(v) * log(p_T(v) / p_S(v))
+
+    Each TP rank holds a shard of the vocabulary dimension. Global normalization
+    (softmax) is handled via all-reduce before computing the divergence.
+
+    Args:
+        student_logits: Student model logits, shape [seq_len, V_local].
+        teacher_logits: Teacher model logits, shape [seq_len, V_local].
+        process_group: Tensor-parallel process group for all-reduce.
+
+    Returns:
+        Per-token forward-KL values, shape [seq_len].
+    """
+    student_max = student_logits.max(dim=-1, keepdim=True).values
+    teacher_max = teacher_logits.max(dim=-1, keepdim=True).values
+    if process_group is not None:
+        dist.all_reduce(student_max, op=dist.ReduceOp.MAX, group=process_group)
+        dist.all_reduce(teacher_max, op=dist.ReduceOp.MAX, group=process_group)
+
+    student_exp = (student_logits - student_max).exp()
+    teacher_exp = (teacher_logits - teacher_max).exp()
+
+    student_sum_exp = student_exp.sum(dim=-1, keepdim=True)
+    teacher_sum_exp = teacher_exp.sum(dim=-1, keepdim=True)
+    if process_group is not None:
+        dist.all_reduce(student_sum_exp, group=process_group)
+        dist.all_reduce(teacher_sum_exp, group=process_group)
+
+    student_probs = student_exp / student_sum_exp  # [seq_len, V_local]
+    teacher_probs = teacher_exp / teacher_sum_exp  # [seq_len, V_local]
+
+    # KL(p_T || p_S) = sum_v  p_T * (log p_T - log p_S)
+    eps = 1e-10
+    kl_local = teacher_probs * (
+        teacher_probs.clamp(min=eps).log() - student_probs.clamp(min=eps).log()
+    )
+    kl = kl_local.sum(dim=-1)  # [seq_len]
+    if process_group is not None:
+        dist.all_reduce(kl, group=process_group)
+
+    return kl
+
+
 def calculate_log_probs_and_entropy(logits, tokens, tp_group, with_entropy: bool = False, chunk_size: int = -1):
     logits = logits.contiguous()
     # TODO: not sure why we need to clone the logits here.

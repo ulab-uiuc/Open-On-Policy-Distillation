@@ -10,4 +10,7 @@ docker exec -it siqi_slime_opsd bash
 
 bash start.ps1
 
+apt install iproute2 -y
 
+export RAY_memory_usage_threshold=0.99
+export RAY_memory_monitor_refresh_ms=0
