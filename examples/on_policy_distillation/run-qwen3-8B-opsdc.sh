@@ -115,7 +115,7 @@ CKPT_ARGS=(
    # Paper Algorithm 1: teacher is synced with student every M=50 training steps.
    # --ref-update-interval controls how often the "ref" weight backup is refreshed.
    # Combined with --opsd-use-ref-as-teacher, this implements the periodic refresh.
-   --ref-update-interval 20
+   # --ref-update-interval 20
 )
 
 ROLLOUT_ARGS=(
@@ -193,8 +193,11 @@ GRPO_ARGS=(
    # Without this flag, teacher = live student weights at every step (M=1 approx),
    # which loses the stabilizing effect of a frozen teacher window.
    --opsd-use-ref-as-teacher
-
    --entropy-coef 0.00
+
+   # --- opsd + 原来的KL 的实验 ---
+   --use-kl-loss
+   --kl-loss-coef 0.01       # 这是你的 beta，按需调整
 )
 
 OPTIMIZER_ARGS=(
@@ -210,7 +213,7 @@ OPTIMIZER_ARGS=(
 WANDB_ARGS=(
    --use-wandb
    --wandb-project slime-dev
-   --wandb-group qwen3-4B-opsdc-reverse_kl
+   --wandb-group qwen3-4B-opsdc-reverse_kl+_ref_kl
    --wandb-key 2ed6f8544ac3e30d5c08879166cc10d9c6232448
 )
 
