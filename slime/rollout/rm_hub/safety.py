@@ -127,8 +127,11 @@ async def _call_llm_judge(
     payload = {
         "model": model,
         "messages": messages,
-        "max_tokens": 8,
+        "max_tokens": 2048,
         "temperature": 0.0,
+        # Disable chain-of-thought for the judge when served via SGLang (Qwen3).
+        # This is a no-op for providers that do not recognise the field.
+        "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
     }
     headers = {
         "Authorization": f"Bearer {api_key}",

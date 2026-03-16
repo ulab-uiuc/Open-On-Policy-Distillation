@@ -26,41 +26,41 @@
 #   # Easy (PKU-SafeRLHF):
 #   python examples/prompt_internalization/preprocess_pi_safety.py \
 #       --dataset PKU-Alignment/PKU-SafeRLHF --split train \
-#       --output data/pi_safety/train_pku.jsonl
+#       --output /root/slime_siqi/data/pi_safety/train_pku.jsonl
 
 #   # Medium — BeaverTails train:
 #   python examples/prompt_internalization/preprocess_pi_safety.py \
 #       --dataset PKU-Alignment/BeaverTails --split 30k-train \
-#       --output data/pi_safety/train_beavertails.jsonl
+#       --output /root/slime_siqi/data/pi_safety/train_beavertails.jsonl
 
 #   # Hard — WildGuardMix (adversarial jailbreaks, dataset: allenai/wildguardmix):
 #   python examples/prompt_internalization/preprocess_pi_safety.py \
 #       --dataset allenai/wildguardmix --config wildguardtrain --split train \
-#       --output data/pi_safety/train_wildguardmix.jsonl
+#       --output /root/slime_siqi/data/pi_safety/train_wildguardmix.jsonl
 
 #   # Eval — BeaverTails test:
 #   python examples/prompt_internalization/preprocess_pi_safety.py \
 #       --dataset PKU-Alignment/BeaverTails --split 30k-test \
-#       --output data/pi_safety/eval_beavertails.jsonl
+#       --output /root/slime_siqi/data/pi_safety/eval_beavertails.jsonl
 
 #   # Eval — WildGuardMix test set:
 #   python examples/prompt_internalization/preprocess_pi_safety.py \
 #       --dataset allenai/wildguardmix --config wildguardtest \
 #       --split test \
-#       --output data/pi_safety/eval_wildguardtest.jsonl
+#       --output /root/slime_siqi/data/pi_safety/eval_wildguardtest.jsonl
 
 #   # Eval — Bullshit-Benchmark (tests whether the model detects fabricated/nonsensical premises):
 #   python examples/prompt_internalization/preprocess_bullshit.py \
-#       --questions data/questions.v2.json \
-#       --output data/pi_safety/eval_bullshit.jsonl
+#       --questions /root/slime_siqi/data/questions.v2.json \
+#       --output /root/slime_siqi/data/pi_safety/eval_bullshit.jsonl
 
 #   # With LLM judge (recommended for final eval):
 #   python examples/prompt_internalization/preprocess_bullshit.py \
-#       --questions data/questions.v2.json \
-#       --output data/pi_safety/eval_bullshit.jsonl \
+#       --questions /root/slime_siqi/data/questions.v2.json \
+#       --output /root/slime_siqi/data/pi_safety/eval_bullshit.jsonl \
 #       --judge-mode llm
 #   export JUDGE_MODE=llm
-#   export JUDGE_API_BASE=http://172.22.224.251:30000/v1
+#   export JUDGE_API_BASE=http://0.0.0.0:30000/v1
 #   export JUDGE_API_KEY=EMPTY
 #   export JUDGE_MODEL=Qwen/Qwen3-30B-A3B-Instruct-2507
 
@@ -101,10 +101,10 @@ CKPT_ARGS=(
 ###############################################################################
 
 # Training data — switch path to select difficulty:
-#   easy:   data/pi_safety/train_pku.jsonl
-#   medium: data/pi_safety/train_beavertails.jsonl  (current)
-#   hard:   data/pi_safety/train_wildguardmix.jsonl
-TRAIN_DATA=data/pi_safety/train_wildguardmix.jsonl
+#   easy:   /root/slime_siqi/data/pi_safety/train_pku.jsonl
+#   medium: /root/slime_siqi/data/pi_safety/train_beavertails.jsonl  (current)
+#   hard:   /root/slime_siqi/data/pi_safety/train_wildguardmix.jsonl
+TRAIN_DATA=/root/slime_siqi/data/pi_safety/train_wildguardmix.jsonl
 
 ROLLOUT_ARGS=(
     --prompt-data ${TRAIN_DATA}
@@ -182,7 +182,7 @@ GRPO_ARGS=(
     --opsd-teacher-info-mode pi
 
     # Wiener KL distillation loss (same as OPSDC)
-    --opsd-loss-type forward_kl
+    --opsd-loss-type reverse_kl
     --opsd-jsd-coef 1.0
     --opsd-pure-mode
 
@@ -220,7 +220,7 @@ OPTIMIZER_ARGS=(
 WANDB_ARGS=(
     --use-wandb
     --wandb-project slime-dev
-    --wandb-group qwen3-1.7B-pi-safety-train-wildguard_test-bullshit
+    --wandb-group qwen3-1.7B-pi-safety-train-wildguard_test-bullshit-reverse_kl
     --wandb-key 2ed6f8544ac3e30d5c08879166cc10d9c6232448
 )
 
