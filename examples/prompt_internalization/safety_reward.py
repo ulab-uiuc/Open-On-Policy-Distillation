@@ -10,7 +10,7 @@ Plugged in via:
 reward_func
     Scores each student rollout with compute_safety_reward.
     Mode (keyword vs LLM judge) is read from metadata['judge_mode'] or
-    the SAFETY_JUDGE_MODE environment variable.
+    the JUDGE_MODE environment variable.
 
 post_process_rewards
     Builds teacher tokens using the "pi" info mode:

@@ -1,7 +1,7 @@
 """Safety reward for Prompt Internalization (PI) experiments.
 
 Supports two evaluation modes controlled by metadata['judge_mode'] or
-the SAFETY_JUDGE_MODE environment variable:
+the JUDGE_MODE environment variable:
 
   keyword (default)
       Rule-based refusal/helpfulness detection via regex patterns.
@@ -189,7 +189,7 @@ async def compute_safety_reward(
     # Env var takes priority over metadata so that judge mode can be switched
     # at runtime without re-preprocessing the dataset.
     mode = (
-        os.environ.get("SAFETY_JUDGE_MODE")
+        os.environ.get("JUDGE_MODE")
         # or metadata.get("judge_mode", "keyword")
     )
 

@@ -26,41 +26,58 @@
 #   # Easy (PKU-SafeRLHF):
 #   python examples/prompt_internalization/preprocess_pi_safety.py \
 #       --dataset PKU-Alignment/PKU-SafeRLHF --split train \
-#       --output /root/pi_safety/train_pku.jsonl
-#
+#       --output data/pi_safety/train_pku.jsonl
+
 #   # Medium — BeaverTails train:
 #   python examples/prompt_internalization/preprocess_pi_safety.py \
 #       --dataset PKU-Alignment/BeaverTails --split 30k-train \
-#       --output /root/pi_safety/train_beavertails.jsonl
+#       --output data/pi_safety/train_beavertails.jsonl
 
 #   # Hard — WildGuardMix (adversarial jailbreaks, dataset: allenai/wildguardmix):
 #   python examples/prompt_internalization/preprocess_pi_safety.py \
 #       --dataset allenai/wildguardmix --config wildguardtrain --split train \
-#       --output /root/pi_safety/train_wildguardmix.jsonl
+#       --output data/pi_safety/train_wildguardmix.jsonl
 
 #   # Eval — BeaverTails test:
 #   python examples/prompt_internalization/preprocess_pi_safety.py \
 #       --dataset PKU-Alignment/BeaverTails --split 30k-test \
-#       --output /root/pi_safety/eval_beavertails.jsonl
+#       --output data/pi_safety/eval_beavertails.jsonl
 
 #   # Eval — WildGuardMix test set:
 #   python examples/prompt_internalization/preprocess_pi_safety.py \
 #       --dataset allenai/wildguardmix --config wildguardtest \
 #       --split test \
-#       --output /root/pi_safety/eval_wildguardtest.jsonl
+#       --output data/pi_safety/eval_wildguardtest.jsonl
 
-# LLM judge (optional, for higher-quality eval):
-#   export SAFETY_JUDGE_MODE=llm
-#   export JUDGE_API_BASE=http://0.0.0.0:30000/v1
+#   # Eval — Bullshit-Benchmark (tests whether the model detects fabricated/nonsensical premises):
+#   python examples/prompt_internalization/preprocess_bullshit.py \
+#       --questions data/questions.v2.json \
+#       --output data/pi_safety/eval_bullshit.jsonl
+
+#   # With LLM judge (recommended for final eval):
+#   python examples/prompt_internalization/preprocess_bullshit.py \
+#       --questions data/questions.v2.json \
+#       --output data/pi_safety/eval_bullshit.jsonl \
+#       --judge-mode llm
+#   export JUDGE_MODE=llm
+#   export JUDGE_API_BASE=http://172.22.224.251:30000/v1
 #   export JUDGE_API_KEY=EMPTY
 #   export JUDGE_MODEL=Qwen/Qwen3-30B-A3B-Instruct-2507
 
+# LLM judge (optional, for higher-quality eval):
+#   export JUDGE_MODE=llm
+#   export JUDGE_API_BASE=http://172.22.224.251:30000/v1
+#   export JUDGE_API_KEY=EMPTY
+#   export JUDGE_MODEL=Qwen/Qwen3-30B-A3B-Instruct-2507
+
+# ss -lntp | grep 30000
 set -ex
 export NCCL_P2P_DISABLE=1
 export NCCL_IB_DISABLE=1
 export NCCL_NET_GDR_LEVEL=0
 export NCCL_DEBUG=INFO
 export PYTHONBUFFERED=16
+ulimit -u 65535
 
 NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
 HAS_NVLINK=$([ "$NVLINK_COUNT" -gt 0 ] && echo 1 || echo 0)
@@ -73,9 +90,9 @@ source "/root/slime_siqi/scripts/models/qwen3-1.7B.sh"
 ###############################################################################
 
 CKPT_ARGS=(
-    --hf-checkpoint Qwen/Qwen3-1.7B
-    --ref-load "/root/Qwen3-1.7B_torch_dist"
-    --save /root/slime_siqi/output/Qwen3-1.7B_pi_safety/
+    --hf-checkpoint "/root/checkpoints_siqi/Qwen3-1.7B"
+    --ref-load "/root/checkpoints_siqi/Qwen3-1.7B_torch_dist"
+    --save "/root/slime_siqi/output/Qwen3-1.7B_pi_safety/"
     --save-interval 500
 )
 
@@ -84,10 +101,10 @@ CKPT_ARGS=(
 ###############################################################################
 
 # Training data — switch path to select difficulty:
-#   easy:   /root/pi_safety/train_pku.jsonl
-#   medium: /root/pi_safety/train_beavertails.jsonl  (current)
-#   hard:   /root/pi_safety/train_wildguardmix.jsonl
-TRAIN_DATA=/root/pi_safety/train_wildguardmix.jsonl
+#   easy:   data/pi_safety/train_pku.jsonl
+#   medium: data/pi_safety/train_beavertails.jsonl  (current)
+#   hard:   data/pi_safety/train_wildguardmix.jsonl
+TRAIN_DATA=data/pi_safety/train_wildguardmix.jsonl
 
 ROLLOUT_ARGS=(
     --prompt-data ${TRAIN_DATA}
@@ -203,7 +220,7 @@ OPTIMIZER_ARGS=(
 WANDB_ARGS=(
     --use-wandb
     --wandb-project slime-dev
-    --wandb-group qwen3-1.7B-pi-safety-train-wildguardmix
+    --wandb-group qwen3-1.7B-pi-safety-train-wildguard_test-bullshit
     --wandb-key 2ed6f8544ac3e30d5c08879166cc10d9c6232448
 )
 
@@ -237,28 +254,51 @@ echo "Starting Ray job..."
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 unset RAY_ADDRESS
 ray stop --force || true
-export CUDA_VISIBLE_DEVICES=1,2,7,8
+export CUDA_VISIBLE_DEVICES=2,3,4,5
+RAY_TMP="/tmp/ray_$(date +%s)"
+
 ray start --head \
-    --node-ip-address ${MASTER_ADDR} \
+    --node-ip-address "${MASTER_ADDR}" \
     --num-gpus 4 \
     --disable-usage-stats \
     --dashboard-host=0.0.0.0 \
-    --dashboard-port=8265
+    --port=6380 \
+    --dashboard-port=8266 \
+    --temp-dir "${RAY_TMP}"
+
+# echo "Reset Ray"
+
+# ray stop --force || true
+# pkill -9 raylet gcs_server redis-server plasma_store 2>/dev/null || true
+
+# rm -rf /tmp/ray
+# rm -rf /tmp/ray_siqi/*
+
+# echo "Start Ray"
+
+# ray start --head \
+#     --node-ip-address=127.0.0.1 \
+#     --num-gpus=4 \
+#     --disable-usage-stats \
+#     --dashboard-host=0.0.0.0 \
+#     --dashboard-port=8266 \
+#     --temp-dir=/tmp/ray_$(date +%s)
+
 
 set +e
 echo "Submitting Ray job..."
 
 # Build runtime-env JSON dynamically so that judge-related env vars set on the
-# host (SAFETY_JUDGE_MODE, JUDGE_API_BASE, JUDGE_API_KEY, JUDGE_MODEL) are
+# host (JUDGE_MODE, JUDGE_API_BASE, JUDGE_API_KEY, JUDGE_MODEL) are
 # forwarded into the Ray worker processes.
 RUNTIME_ENV=$(python3 -c "
 import json, os
 env = {
     'PYTHONPATH': '/root/Megatron-LM/',
     'CUDA_DEVICE_MAX_CONNECTIONS': '1',
-    'CUDA_VISIBLE_DEVICES': '1,2,7,8',
+    'CUDA_VISIBLE_DEVICES': '2,3,4,5',
 }
-for key in ('SAFETY_JUDGE_MODE', 'JUDGE_API_BASE', 'JUDGE_API_KEY', 'JUDGE_MODEL'):
+for key in ('JUDGE_MODE', 'JUDGE_API_BASE', 'JUDGE_API_KEY', 'JUDGE_MODEL'):
     val = os.environ.get(key)
     if val:
         env[key] = val
@@ -266,8 +306,9 @@ print(json.dumps({'env_vars': env}))
 ")
 echo "Ray runtime-env: ${RUNTIME_ENV}"
 
-ray job submit --address="http://127.0.0.1:8265" \
+ray job submit --address="http://127.0.0.1:8266" \
     --runtime-env-json="${RUNTIME_ENV}" \
+    --working-dir /root/slime_siqi \
     -- python3 train.py \
     --actor-num-nodes 1 \
     --actor-num-gpus-per-node 2 \
@@ -290,8 +331,8 @@ echo "Ray job exited with code: ${RAY_EXIT_CODE}"
 sleep 10
 
 ray stop --force
-pkill -9 ray
-pkill -9 python
-sleep 3
-pkill -9 ray
-pkill -9 python
+# pkill -9 ray
+# pkill -9 python
+# sleep 3
+# pkill -9 ray
+# pkill -9 python

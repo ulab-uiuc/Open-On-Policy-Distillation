@@ -50,7 +50,7 @@
 #       --output /root/pi_safety/eval_wildguardtest.jsonl
 
 # LLM judge (optional, for higher-quality eval):
-#   export SAFETY_JUDGE_MODE=llm
+#   export JUDGE_MODE=llm
 #   export JUDGE_API_BASE=http://0.0.0.0:30000/v1
 #   export JUDGE_API_KEY=EMPTY
 #   export JUDGE_MODEL=Qwen/Qwen3-30B-A3B-Instruct-2507
@@ -249,7 +249,7 @@ set +e
 echo "Submitting Ray job..."
 
 # Build runtime-env JSON dynamically so that judge-related env vars set on the
-# host (SAFETY_JUDGE_MODE, JUDGE_API_BASE, JUDGE_API_KEY, JUDGE_MODEL) are
+# host (JUDGE_MODE, JUDGE_API_BASE, JUDGE_API_KEY, JUDGE_MODEL) are
 # forwarded into the Ray worker processes.
 RUNTIME_ENV=$(python3 -c "
 import json, os
@@ -258,7 +258,7 @@ env = {
     'CUDA_DEVICE_MAX_CONNECTIONS': '1',
     'CUDA_VISIBLE_DEVICES': '1,2,7,8',
 }
-for key in ('SAFETY_JUDGE_MODE', 'JUDGE_API_BASE', 'JUDGE_API_KEY', 'JUDGE_MODEL'):
+for key in ('JUDGE_MODE', 'JUDGE_API_BASE', 'JUDGE_API_KEY', 'JUDGE_MODEL'):
     val = os.environ.get(key)
     if val:
         env[key] = val

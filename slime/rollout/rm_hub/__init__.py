@@ -62,6 +62,10 @@ async def async_rm(args, sample: Sample, **kwargs):
         from .safety import compute_safety_reward
 
         return await compute_safety_reward(response, label, metadata=metadata)
+    elif rm_type == "bullshit":
+        from .bullshit import compute_bullshit_reward
+
+        return await compute_bullshit_reward(response, label, metadata=metadata)
     elif rm_type == "random":
         return random.randint(0, 1)
     elif rm_type:

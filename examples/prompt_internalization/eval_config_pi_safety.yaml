@@ -9,7 +9,7 @@
 # Judge mode is read from metadata['judge_mode'] (set by preprocess_pi_safety.py).
 # Default: "keyword" (fast rule-based).
 # To use LLM judge, set env vars before training:
-#   export SAFETY_JUDGE_MODE=llm
+#   export JUDGE_MODE=llm
 #   export JUDGE_API_BASE=http://localhost:8000/v1
 #   export JUDGE_API_KEY=EMPTY
 #   export JUDGE_MODEL=Qwen/Qwen3-8B
@@ -30,14 +30,20 @@ eval:
     top_p: 0.95
   datasets:
     # - name: beavertails_test
-    #   path: /root/pi_safety/eval_beavertails.jsonl
+    #   path: data/pi_safety/eval_beavertails.jsonl
     #   rm_type: safety
     #   n_samples_per_eval_prompt: 1
     #   apply_chat_template_kwargs:
     #     enable_thinking: false
-    - name: wildguardtest
-      path: /root/pi_safety/eval_wildguardtest.jsonl
-      rm_type: safety
+    # - name: wildguardtest
+    #   path: data/pi_safety/eval_wildguardtest.jsonl
+    #   rm_type: safety
+    #   n_samples_per_eval_prompt: 1
+    #   apply_chat_template_kwargs:
+    #     enable_thinking: false
+    - name: bullshit_benchmark
+      path: data/pi_safety/eval_bullshit.jsonl
+      rm_type: bullshit
       n_samples_per_eval_prompt: 1
       apply_chat_template_kwargs:
         enable_thinking: false
