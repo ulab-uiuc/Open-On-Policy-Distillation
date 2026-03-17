@@ -40,7 +40,7 @@ else
 fi
 echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
-source "/root/slime_siqi/scripts/models/qwen3-4B.sh"
+source "/root/slime_siqi/scripts/models/qwen3-1.7B.sh"
 
 ###############################################################################
 # Step 0: Build JSONL data using the unified preprocess_dataset.py utility.
@@ -65,9 +65,9 @@ PREPROCESS="python3 examples/on_policy_distillation/preprocess_dataset.py"
 
 # ---- Training dataset -------------------------------------------------------
 # Switch between supported datasets by changing TRAIN_DATASET / TRAIN_CONFIG.
-TRAIN_DATASET="${TRAIN_DATASET:-BytedTsinghua-SIA/DAPO-Math-17k}"
-TRAIN_CONFIG="${TRAIN_CONFIG:-}"          # e.g. "metadata" for OpenThoughts-114k
-TRAIN_OUT="/root/math/data/train_opsdc.jsonl"
+TRAIN_DATASET="${TRAIN_DATASET:-open-thoughts/OpenThoughts-114k}"
+TRAIN_CONFIG="${TRAIN_CONFIG:-metadata}"  # "metadata" for OpenThoughts-114k; leave empty for DAPO
+TRAIN_OUT="/root/math/data/train_openthoughts.jsonl"
 
 # Answer format style for training and eval, independently configurable.
 #   "boxed"  – model wraps final answer in \boxed{}  (natural for thinking mode)
@@ -84,7 +84,7 @@ TRAIN_OUT="/root/math/data/train_opsdc.jsonl"
 #     TRAIN_ANSWER_FORMAT=boxed EVAL_ANSWER_FORMAT=boxed bash run-qwen3-8B-opsdc.sh
 #   Both answer:
 #     TRAIN_ANSWER_FORMAT=answer EVAL_ANSWER_FORMAT=answer bash run-qwen3-8B-opsdc.sh
-TRAIN_ANSWER_FORMAT="${TRAIN_ANSWER_FORMAT:-answer}"
+TRAIN_ANSWER_FORMAT="${TRAIN_ANSWER_FORMAT:-boxed}"
 EVAL_ANSWER_FORMAT="${EVAL_ANSWER_FORMAT:-boxed}"
 
 TRAIN_ARGS=(--dataset "$TRAIN_DATASET" --split train --output "$TRAIN_OUT" --answer-format "$TRAIN_ANSWER_FORMAT")
@@ -111,9 +111,9 @@ $PREPROCESS --dataset HuggingFaceH4/MATH-500     --split test  --output /root/ma
 ###############################################################################
 
 CKPT_ARGS=(
-   --hf-checkpoint Qwen/Qwen3-4B
-   --ref-load "/root/Qwen3-4B_torch_dist"
-   --save /root/slime_siqi/output/Qwen3-4B_opsdc_slime/
+   --hf-checkpoint Qwen/Qwen3-1.7B
+   --ref-load "/root/checkpoints_siqi/Qwen3-1.7B_torch_dist"
+   --save /root/slime_siqi/output/Qwen3-1.7B_opsdc_slime/
    --save-interval 2000
    # Paper Algorithm 1: teacher is synced with student every M=50 training steps.
    # --ref-update-interval controls how often the "ref" weight backup is refreshed.
@@ -122,7 +122,7 @@ CKPT_ARGS=(
 )
 
 ROLLOUT_ARGS=(
-   --prompt-data /root/math/data/train_opsdc.jsonl
+   --prompt-data "$TRAIN_OUT"
    --input-key prompt
    --label-key label
    --apply-chat-template
@@ -179,10 +179,10 @@ GRPO_ARGS=(
    # OPSDC-specific: use conciseness instruction as teacher privileged context
    # Teacher = same model + conciseness instruction prepended to problem
    # Student = same model + problem only (no conciseness instruction)
-   --opsd-teacher-info-mode full
+   --opsd-teacher-info-mode answer_only
 
    # Reverse KL: KL(student || teacher) -- mode-seeking, per OPSDC paper Eq.(1)
-   --opsd-loss-type wiener_kl
+   --opsd-loss-type forward_kl
    --opsd-jsd-coef 1.0           # α: teacher KL 权重，与 pg_loss 并存时适当降低
 
    # pg_loss 正常参与训练
@@ -220,7 +220,7 @@ OPTIMIZER_ARGS=(
 WANDB_ARGS=(
    --use-wandb
    --wandb-project slime-dev
-   --wandb-group qwen3-4B-opsdc-wiener_kl+_ref_kl_PI_openthought
+   --wandb-group qwen3-1.7B-opsdc-forward_kl+_ref_kl_answeronly_openthought
    --wandb-key 2ed6f8544ac3e30d5c08879166cc10d9c6232448
 )
 
@@ -256,7 +256,7 @@ ray job submit --address="http://127.0.0.1:8265" \
      "env_vars": {
         "PYTHONPATH": "/root/Megatron-LM/",
         "CUDA_DEVICE_MAX_CONNECTIONS": "1",
-        "CUDA_VISIBLE_DEVICES": "1,2,3,4"
+        "CUDA_VISIBLE_DEVICES": "2,3,4,5"
      }
    }' \
    -- python3 train.py \

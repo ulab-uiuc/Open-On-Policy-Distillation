@@ -39,6 +39,7 @@ Exported symbols used via CLI args:
     --reward-key math_reward
 """
 
+import json
 import logging
 import random
 from functools import lru_cache
@@ -217,6 +218,21 @@ def post_process_rewards(args, samples, **kwargs):
     teacher_info_mode = getattr(args, "opsd_teacher_info_mode", "full")
     reasoning_mask_ratio = float(getattr(args, "opsd_reasoning_mask_ratio", 0.5))
 
+    # Derive enable_thinking from --apply-chat-template-kwargs so the teacher
+    # prompt template exactly matches the student's generation mode.
+    # If the student runs with enable_thinking=false the teacher must also use
+    # enable_thinking=False, otherwise the teacher prompt ends with <think>\n
+    # but the student response tokens contain no <think>, causing a systematic
+    # KL mismatch at the very first token.
+    _chat_template_kwargs: dict = {}
+    _raw_kwargs = getattr(args, "apply_chat_template_kwargs", None)
+    if _raw_kwargs:
+        try:
+            _chat_template_kwargs = json.loads(_raw_kwargs)
+        except Exception:
+            pass
+    _teacher_enable_thinking: bool = _chat_template_kwargs.get("enable_thinking", True)
+
     # Per-sample format_instruction is read from metadata below; this is only
     # used as a last-resort fallback when the field is missing from metadata.
     _global_format_suffix = _DEFAULT_FORMAT_SUFFIX
@@ -269,20 +285,26 @@ def post_process_rewards(args, samples, **kwargs):
             # so the teacher stays in the response distribution.
             # Use label (extracted final answer) preferentially over reference_solution
             # (which may contain full reasoning steps for datasets like OpenThoughts-114k).
+            #
+            # Use student_user_content (which already has the correct format instruction
+            # embedded for all dataset types) as the base.  This avoids duplicating the
+            # format instruction for DAPO datasets where raw_content == student_user_content
+            # (i.e., the format instruction is already baked into the prompt text).
+            # The pattern mirrors the 'conciseness' and 'pi' modes.
             _ANSWER_ONLY_PROMPT = (
                 "The correct final answer to this problem is: {answer}\n"
                 "Now solve the problem yourself step by step and arrive at the same answer:"
             )
             answer_hint = label if label else reference_solution
+            student_user_content = metadata.get("student_user_content") or raw_content
             if answer_hint:
                 teacher_user_content = (
-                    f"{raw_content}\n\n"
+                    f"{student_user_content}\n\n"
                     + _ANSWER_ONLY_PROMPT.format(answer=answer_hint)
-                    + f"\n{format_instruction}"
                 )
             else:
-                # No reference answer available; fall back to standard prompt.
-                teacher_user_content = f"{raw_content}\n\n{format_instruction}"
+                # No reference answer available; fall back to standard student prompt.
+                teacher_user_content = student_user_content
 
         elif teacher_info_mode == "masked_reasoning":
             # Teacher receives the full reference solution structure, but the
@@ -375,13 +397,12 @@ def post_process_rewards(args, samples, **kwargs):
         ]
 
         # Tokenize teacher prompt. add_generation_prompt=True keeps assistant turn open.
-        # enable_thinking=True ensures the teacher prompt ends with <think>\n, matching
-        # the student response tokens which also begin with <think> (student rollout uses
-        # enable_thinking=True). Without this, the teacher assigns lower probability to
-        # <think> as the first token, causing a systematic KL mismatch.
+        # enable_thinking must match --apply-chat-template-kwargs used for student rollout.
+        # Mismatching would cause a systematic KL error at the very first token
+        # (teacher prompt ending with <think>\n while student response has no <think>).
         teacher_prompt_text = tokenizer.apply_chat_template(
             teacher_messages, tokenize=False, add_generation_prompt=True,
-            enable_thinking=True
+            enable_thinking=_teacher_enable_thinking
         )
         teacher_prompt_tokens = tokenizer.encode(teacher_prompt_text, add_special_tokens=False)
 
