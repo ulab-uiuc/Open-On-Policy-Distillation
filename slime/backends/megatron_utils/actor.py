@@ -252,6 +252,52 @@ class MegatronTrainRayActor(TrainRayActor):
                     )
                 )
             ]
+        if "opd_topk_token_ids" in rollout_data:
+            rollout_data["opd_topk_token_ids"] = [
+                torch.tensor(
+                    slice_log_prob_with_cp(
+                        token_ids,
+                        total_length,
+                        response_length,
+                        self.args.qkv_format,
+                        rollout_data["max_seq_lens"][i] if self.args.qkv_format == "bshd" else None,
+                    ),
+                    device=torch.cuda.current_device(),
+                    dtype=torch.long,
+                )
+                for i, (token_ids, total_length, response_length) in enumerate(
+                    zip(
+                        rollout_data["opd_topk_token_ids"],
+                        rollout_data["total_lengths"],
+                        rollout_data["response_lengths"],
+                        strict=False,
+                    )
+                )
+            ]
+        for key in ["opd_topk_student_log_probs", "opd_topk_teacher_log_probs"]:
+            if key not in rollout_data:
+                continue
+            rollout_data[key] = [
+                torch.tensor(
+                    slice_log_prob_with_cp(
+                        log_prob,
+                        total_length,
+                        response_length,
+                        self.args.qkv_format,
+                        rollout_data["max_seq_lens"][i] if self.args.qkv_format == "bshd" else None,
+                    ),
+                    device=torch.cuda.current_device(),
+                    dtype=torch.float32,
+                )
+                for i, (log_prob, total_length, response_length) in enumerate(
+                    zip(
+                        rollout_data[key],
+                        rollout_data["total_lengths"],
+                        rollout_data["response_lengths"],
+                        strict=False,
+                    )
+                )
+            ]
         if "rollout_routed_experts" in rollout_data:
             rollout_data["rollout_routed_experts"] = [
                 torch.from_numpy(r) for r in rollout_data["rollout_routed_experts"]

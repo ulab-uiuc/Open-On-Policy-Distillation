@@ -422,6 +422,8 @@ def log_rollout_data(
                 # OPSD: raw token sequences — not scalar metrics
                 "teacher_tokens",
                 "teacher_prompt_lengths",
+                # OPD top-k index payload
+                "opd_topk_token_ids",
             ]:
                 continue
             # Upload per sample mean for each rollout value
@@ -440,6 +442,9 @@ def log_rollout_data(
                         "values",
                         "teacher_log_probs",
                         "opd_reverse_kl",
+                        "opd_topk_student_mass",
+                        "opd_topk_teacher_mass",
+                        "opd_topk_tail_kl",
                     ]:
                         val = torch.cat(val).clone().detach()
                         sum_of_sample_mean = get_sum_of_sample_mean(

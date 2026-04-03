@@ -917,6 +917,369 @@ def compute_vocab_parallel_wiener_kl(
     return loss, w_t
 
 
+def compute_vocab_parallel_topk_forward_kl(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    k: int,
+    process_group: dist.ProcessGroup | None,
+    topk_source: str = "teacher",
+) -> torch.Tensor:
+    """Compute partial Forward KL restricted to the global top-k token positions.
+
+    Both teacher and student use **full-vocabulary** normalisation, so this
+    loss has the same numerical scale as ``compute_vocab_parallel_forward_kl``.
+    Memory efficiency comes from never materialising a full [seq_len, V] probability
+    tensor: the logsumexp partition functions are O(V) scans that require only
+    O(1) extra memory, and the KL sum operates on [seq_len, k_local] tensors only.
+
+        KL_partial = sum_{v in top-k} p_T(v) * log(p_T(v) / p_S(v))
+
+    where  p_T(v) = exp(t_v) / Z_T_full   (full-vocab normalised)
+           p_S(v) = exp(s_v) / Z_S_full   (full-vocab normalised)
+
+    This is always <= full forward_kl (the dropped terms are non-negative) and
+    approaches it as k -> V.
+
+    Two modes via ``topk_source`` control which positions are included:
+
+    * ``"teacher"`` (default): top-k selected by teacher logits.
+      Focuses gradient on what the teacher is most confident about.
+
+    * ``"student"``: top-k selected by student logits.
+      Focuses gradient on where the student currently places the most mass,
+      pushing those tokens toward the teacher distribution.
+
+    Args:
+        student_logits: Student model logits, shape [seq_len, V_local].
+        teacher_logits: Teacher model logits, shape [seq_len, V_local].
+        k: Number of top tokens to include in the partial KL sum.
+        process_group: Tensor-parallel process group for all-reduce / all-gather.
+        topk_source: Which model's logits to use for top-k selection.
+            One of ``"teacher"`` (default) or ``"student"``.
+
+    Returns:
+        Per-token partial forward-KL values, shape [seq_len].
+    """
+    world_size = dist.get_world_size(process_group) if process_group is not None else 1
+
+    # --- Step 1: Full-vocab log partition functions (O(V) scan, O(1) extra memory) ---
+    # Using full-vocab Z for both teacher and student keeps the loss on the same
+    # scale as forward_kl regardless of k or topk_source.
+    teacher_log_Z_local = torch.logsumexp(teacher_logits, dim=-1, keepdim=True)  # [seq_len, 1]
+    student_log_Z_local = torch.logsumexp(student_logits, dim=-1, keepdim=True)  # [seq_len, 1]
+
+    if process_group is not None:
+        gathered_tlz = [torch.zeros_like(teacher_log_Z_local) for _ in range(world_size)]
+        gathered_slz = [torch.zeros_like(student_log_Z_local) for _ in range(world_size)]
+        dist.all_gather(gathered_tlz, teacher_log_Z_local, group=process_group)
+        dist.all_gather(gathered_slz, student_log_Z_local, group=process_group)
+        teacher_log_Z = torch.logsumexp(torch.cat(gathered_tlz, dim=-1), dim=-1, keepdim=True)
+        student_log_Z = torch.logsumexp(torch.cat(gathered_slz, dim=-1), dim=-1, keepdim=True)
+    else:
+        teacher_log_Z = teacher_log_Z_local
+        student_log_Z = student_log_Z_local
+
+    # --- Step 2: Select top-k indices from the chosen source ---
+    # softmax is order-preserving so top-k of logits == top-k of probs
+    source_logits = student_logits if topk_source == "student" else teacher_logits
+    k_local = max(1, min(k, source_logits.size(-1)))
+    local_topk_source, local_topk_idx = source_logits.topk(k_local, dim=-1, sorted=True)
+
+    # Gather teacher and student logits at the selected positions [seq_len, k_local]
+    if topk_source == "student":
+        local_topk_teacher = teacher_logits.gather(-1, local_topk_idx)
+        local_topk_student = local_topk_source
+    else:
+        local_topk_teacher = local_topk_source
+        local_topk_student = student_logits.gather(-1, local_topk_idx)
+
+    # --- Step 3: Determine global top-k threshold via all-gather of local candidates ---
+    if process_group is not None:
+        gathered = [torch.zeros_like(local_topk_source) for _ in range(world_size)]
+        dist.all_gather(gathered, local_topk_source, group=process_group)
+        all_candidates = torch.cat(gathered, dim=-1)  # [seq_len, k_local * world_size]
+    else:
+        all_candidates = local_topk_source
+
+    total_candidates = all_candidates.size(-1)
+    actual_k = min(k, total_candidates)
+    threshold = all_candidates.kthvalue(total_candidates - actual_k + 1, dim=-1).values  # [seq_len]
+    in_topk = local_topk_source >= threshold.unsqueeze(-1)  # [seq_len, k_local]
+
+    # --- Step 4: Partial forward KL on [seq_len, k_local] sparse tensors ---
+    # log p_T(v) and log p_S(v) both use full-vocab Z -- same scale as forward_kl.
+    log_p_T = local_topk_teacher - teacher_log_Z  # [seq_len, k_local]
+    log_p_S = local_topk_student - student_log_Z  # [seq_len, k_local]
+
+    in_topk_f = in_topk.float()
+    p_T = log_p_T.exp() * in_topk_f               # zero out non-global-top-k positions
+    kl_local = p_T * (log_p_T - log_p_S) * in_topk_f
+
+    kl = kl_local.sum(dim=-1)  # [seq_len]
+    if process_group is not None:
+        dist.all_reduce(kl, group=process_group)
+
+    return kl
+
+
+def compute_vocab_parallel_topk_tail_kl(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    k: int,
+    process_group: dist.ProcessGroup | None,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Approximate KL(π_S || π_T) with top-K exact terms plus a single tail bucket.
+
+    Decomposes the full reverse KL into two parts:
+
+        KL(π_S || π_T) ≈  Σ_{v ∈ top-K(π_S)} π_S(v) · log(π_S(v) / π_T(v))
+                        +  π_S_tail · log(π_S_tail / π_T_tail)
+
+    where  top-K is selected by the **student** distribution,
+           π_S_tail = 1 - Σ_{top-K} π_S(v),
+           π_T_tail = 1 - Σ_{top-K} π_T(v at student top-K positions).
+
+    This is the SDPO approximation (eq. 11): the top-K terms are computed exactly
+    on [seq_len, k_local] sparse tensors; the tail collapses all remaining V-k
+    tokens into one bucket, keeping memory O(k) while preserving the tail penalty.
+    Both π_S and π_T use full-vocabulary normalisation, so the loss is on the
+    same numerical scale as ``compute_vocab_parallel_reverse_kl``.
+
+    Note: ``teacher_logits`` must already be detached (stopgrad) by the caller.
+
+    Args:
+        student_logits: Student model logits, shape [seq_len, V_local].
+        teacher_logits: Teacher model logits (detached), shape [seq_len, V_local].
+        k: Number of top student-probability tokens for the exact KL terms.
+        process_group: Tensor-parallel process group for all-reduce / all-gather.
+        eps: Numerical floor applied to tail masses before taking log.
+
+    Returns:
+        Per-token approximate reverse-KL values, shape [seq_len].
+    """
+    world_size = dist.get_world_size(process_group) if process_group is not None else 1
+
+    # --- Step 1: Full-vocab log partition functions (O(V) scan, O(1) extra memory) ---
+    student_log_Z_local = torch.logsumexp(student_logits, dim=-1, keepdim=True)  # [seq_len, 1]
+    teacher_log_Z_local = torch.logsumexp(teacher_logits, dim=-1, keepdim=True)  # [seq_len, 1]
+
+    if process_group is not None:
+        gathered_slz = [torch.zeros_like(student_log_Z_local) for _ in range(world_size)]
+        gathered_tlz = [torch.zeros_like(teacher_log_Z_local) for _ in range(world_size)]
+        dist.all_gather(gathered_slz, student_log_Z_local, group=process_group)
+        dist.all_gather(gathered_tlz, teacher_log_Z_local, group=process_group)
+        student_log_Z = torch.logsumexp(torch.cat(gathered_slz, dim=-1), dim=-1, keepdim=True)
+        teacher_log_Z = torch.logsumexp(torch.cat(gathered_tlz, dim=-1), dim=-1, keepdim=True)
+    else:
+        student_log_Z = student_log_Z_local
+        teacher_log_Z = teacher_log_Z_local
+
+    # --- Step 2: Select global top-K by student logits ---
+    k_local = max(1, min(k, student_logits.size(-1)))
+    local_topk_student, local_topk_idx = student_logits.topk(k_local, dim=-1, sorted=True)
+    local_topk_teacher = teacher_logits.gather(-1, local_topk_idx)  # [seq_len, k_local]
+
+    if process_group is not None:
+        gathered = [torch.zeros_like(local_topk_student) for _ in range(world_size)]
+        dist.all_gather(gathered, local_topk_student, group=process_group)
+        all_candidates = torch.cat(gathered, dim=-1)  # [seq_len, k_local * world_size]
+    else:
+        all_candidates = local_topk_student
+
+    total_candidates = all_candidates.size(-1)
+    actual_k = min(k, total_candidates)
+    threshold = all_candidates.kthvalue(total_candidates - actual_k + 1, dim=-1).values  # [seq_len]
+    in_topk = local_topk_student >= threshold.unsqueeze(-1)  # [seq_len, k_local]
+
+    # --- Step 3: Full-vocab log-probs at top-K positions [seq_len, k_local] ---
+    log_p_S = local_topk_student - student_log_Z  # full-vocab normalised student
+    log_p_T = local_topk_teacher - teacher_log_Z  # full-vocab normalised teacher
+
+    in_topk_f = in_topk.float()
+    p_S = log_p_S.exp() * in_topk_f  # [seq_len, k_local], zeroed for non-global-top-K
+    p_T = log_p_T.exp() * in_topk_f  # [seq_len, k_local]
+
+    # --- Step 4: Top-K exact reverse KL terms ---
+    kl_topk_local = (p_S * (log_p_S - log_p_T) * in_topk_f).sum(dim=-1)  # [seq_len]
+
+    # Total student / teacher mass covered by student top-K (needed for tail)
+    p_S_mass_local = p_S.sum(dim=-1)  # [seq_len]
+    p_T_mass_local = p_T.sum(dim=-1)  # [seq_len]
+
+    if process_group is not None:
+        dist.all_reduce(kl_topk_local, group=process_group)
+        dist.all_reduce(p_S_mass_local, group=process_group)
+        dist.all_reduce(p_T_mass_local, group=process_group)
+
+    # --- Step 5: Tail bucket term ---
+    # Treat all V-k remaining tokens as one aggregate bucket.
+    # p_S_tail = student mass outside top-K; p_T_tail = teacher mass at same positions.
+    p_S_tail = (1.0 - p_S_mass_local).clamp(min=eps)  # [seq_len]
+    p_T_tail = (1.0 - p_T_mass_local).clamp(min=eps)  # [seq_len]
+    kl_tail = p_S_tail * (p_S_tail.log() - p_T_tail.log())  # [seq_len]
+    # kl_tail is computed from globally reduced scalars → same on all TP ranks, no all_reduce needed
+
+    return kl_topk_local + kl_tail
+
+
+def compute_decoded_sequence_kl(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    response_tokens: torch.Tensor,
+    process_group: dist.ProcessGroup | None,
+) -> torch.Tensor:
+    """Compute per-token KL restricted to the actually decoded tokens.
+
+    For each response position t with decoded token y_t, returns:
+        kl_t = log p_T(y_t) - log p_S(y_t)
+
+    This is a 1-sample Monte Carlo estimate of the KL divergence.  Minimising
+    this loss pushes the student to assign higher log-probability to every token
+    the teacher (and the student's own rollout) has already decoded, without
+    incurring the cost of a full-vocabulary softmax all-reduce.
+
+    Note: gradient flows only through log p_S(y_t); the teacher term is a
+    constant w.r.t. student parameters.
+
+    Args:
+        student_logits: Student model logits, shape [seq_len, V_local].
+        teacher_logits: Teacher model logits, shape [seq_len, V_local].
+        response_tokens: Decoded token ids, shape [seq_len], long tensor.
+        process_group: Tensor-parallel process group.
+
+    Returns:
+        Per-token decoded-sequence KL values, shape [seq_len].
+    """
+    # compute_log_probs uses fused vocab-parallel cross-entropy; clone() avoids
+    # in-place modification of logits that are still needed for backward.
+    log_pi_T = compute_log_probs(teacher_logits.clone(), response_tokens, process_group).squeeze(-1)
+    log_pi_S = compute_log_probs(student_logits.clone(), response_tokens, process_group).squeeze(-1)
+    return log_pi_T - log_pi_S
+
+
+def compute_vocab_parallel_kl_biased_ppo_advantage(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    k: int,
+    eta: float,
+    tau: float,
+    process_group: dist.ProcessGroup | None,
+) -> torch.Tensor:
+    """Compute KL-biased per-token distillation loss for OPSD.
+
+    loss = KL(pi_old || pi_te) + eta * 1[H_te > tau] * KL_topktail(pi_te || pi_old)
+
+    where KL_topktail uses the full-vocab normalized teacher distribution over the
+    global top-k teacher tokens, plus a single tail-bucket term to guarantee the
+    forward-KL component is always non-negative.
+
+    Args:
+        student_logits: Student (old policy) logits [seq_len, V_local], temperature-scaled.
+        teacher_logits: Teacher logits [seq_len, V_local], temperature-scaled, detached.
+        k: Number of top-k teacher tokens for the forward-KL term.
+        eta: Weight for the forward-KL correction term.
+        tau: Entropy threshold: forward-KL term is only applied when H_te > tau.
+        process_group: Tensor-parallel process group for all-reduce / all-gather.
+
+    Returns:
+        loss: Per-token loss values, shape [seq_len]. Always non-negative.
+        gate: Per-token gate indicator (1 if H_te > tau, else 0), shape [seq_len].
+    """
+    world_size = dist.get_world_size(process_group) if process_group is not None else 1
+    eps = 1e-10
+
+    # --- Global numerically-stable softmax ---
+    student_max = student_logits.max(dim=-1, keepdim=True).values
+    teacher_max = teacher_logits.max(dim=-1, keepdim=True).values
+    if process_group is not None:
+        dist.all_reduce(student_max, op=dist.ReduceOp.MAX, group=process_group)
+        dist.all_reduce(teacher_max, op=dist.ReduceOp.MAX, group=process_group)
+
+    student_exp = (student_logits - student_max).exp()
+    teacher_exp = (teacher_logits - teacher_max).exp()
+
+    student_sum_exp = student_exp.sum(dim=-1, keepdim=True)
+    teacher_sum_exp = teacher_exp.sum(dim=-1, keepdim=True)
+    if process_group is not None:
+        dist.all_reduce(student_sum_exp, group=process_group)
+        dist.all_reduce(teacher_sum_exp, group=process_group)
+
+    student_probs = student_exp / student_sum_exp  # [seq_len, V_local]
+    teacher_probs = teacher_exp / teacher_sum_exp  # [seq_len, V_local]
+
+    log_student = student_probs.clamp(min=eps).log()
+    log_teacher = teacher_probs.clamp(min=eps).log()
+
+    # --- Term 1: Reverse KL = KL(pi_old || pi_te) = sum_v pi_old(v) * (log pi_old - log pi_te) ---
+    rev_kl_local = (student_probs * (log_student - log_teacher)).sum(dim=-1)  # [seq_len]
+    if process_group is not None:
+        dist.all_reduce(rev_kl_local, group=process_group)
+    rev_kl = rev_kl_local  # [seq_len]
+
+    # --- Teacher entropy: H_te = -sum_v pi_te(v) * log pi_te(v) ---
+    H_te_local = -(teacher_probs * log_teacher).sum(dim=-1)  # [seq_len]
+    if process_group is not None:
+        dist.all_reduce(H_te_local, group=process_group)
+    H_te = H_te_local  # [seq_len]
+
+    # --- Term 2: Top-k Forward KL with full-vocab normalized teacher ---
+    # Select global top-k by teacher logits
+    k_local = max(1, min(k, teacher_logits.size(-1)))
+    local_topk_teacher, local_topk_idx = teacher_logits.topk(k_local, dim=-1, sorted=True)
+    local_topk_student = student_logits.gather(-1, local_topk_idx)  # [seq_len, k_local]
+
+    # Determine global top-k threshold via all-gather of local candidates
+    if process_group is not None:
+        gathered = [torch.zeros_like(local_topk_teacher) for _ in range(world_size)]
+        dist.all_gather(gathered, local_topk_teacher, group=process_group)
+        all_candidates = torch.cat(gathered, dim=-1)  # [seq_len, k_local * world_size]
+    else:
+        all_candidates = local_topk_teacher
+
+    total_candidates = all_candidates.size(-1)
+    actual_k = min(k, total_candidates)
+    threshold = all_candidates.kthvalue(total_candidates - actual_k + 1, dim=-1).values  # [seq_len]
+    in_topk = local_topk_teacher >= threshold.unsqueeze(-1)  # [seq_len, k_local]
+    in_topk_f = in_topk.float()
+
+    # Teacher and student log-probs at top-k positions (full-vocab normalized)
+    teacher_log_Z = teacher_max + teacher_sum_exp.log()  # [seq_len, 1]
+    log_p_T_topk = local_topk_teacher - teacher_log_Z    # [seq_len, k_local]
+    teacher_probs_topk = log_p_T_topk.exp() * in_topk_f  # zero non-global-top-k
+
+    student_log_Z = student_max + student_sum_exp.log()  # [seq_len, 1]
+    log_p_S_topk = local_topk_student - student_log_Z    # [seq_len, k_local]
+    student_probs_at_T_topk = log_p_S_topk.exp() * in_topk_f  # [seq_len, k_local]
+
+    # Top-k exact forward-KL terms: sum_{v in topk} pi_te(v) * (log pi_te(v) - log pi_old(v))
+    fwd_kl_topk_local = (teacher_probs_topk * (log_p_T_topk - log_p_S_topk) * in_topk_f).sum(dim=-1)
+
+    # Masses over the top-k support (needed for tail)
+    p_T_mass_local = teacher_probs_topk.sum(dim=-1)       # [seq_len]
+    p_S_mass_local = student_probs_at_T_topk.sum(dim=-1)  # [seq_len]
+
+    if process_group is not None:
+        dist.all_reduce(fwd_kl_topk_local, group=process_group)
+        dist.all_reduce(p_T_mass_local, group=process_group)
+        dist.all_reduce(p_S_mass_local, group=process_group)
+
+    # Tail-bucket term: treats all V-k remaining tokens as one aggregate bucket.
+    # p_T_tail = teacher mass outside top-k; p_S_tail = student mass at same positions.
+    # Together with the top-k terms this forms a valid KL on a coarsened vocabulary,
+    # guaranteeing fwd_kl >= 0.
+    p_T_tail = (1.0 - p_T_mass_local).clamp(min=eps)  # [seq_len]
+    p_S_tail = (1.0 - p_S_mass_local).clamp(min=eps)  # [seq_len]
+    kl_tail = p_T_tail * (p_T_tail.log() - p_S_tail.log())  # [seq_len]
+
+    fwd_kl = fwd_kl_topk_local + kl_tail  # [seq_len], guaranteed >= 0
+
+    # --- Entropy gate and combined loss ---
+    gate = (H_te > tau).float()  # [seq_len]
+    loss = rev_kl + eta * gate * fwd_kl  # [seq_len]
+    return loss, gate
+
+
 def calculate_log_probs_and_entropy(logits, tokens, tp_group, with_entropy: bool = False, chunk_size: int = -1):
     logits = logits.contiguous()
     # TODO: not sure why we need to clone the logits here.

@@ -10,6 +10,9 @@ data/
 *.pt
 *.ckpt
 
+student_teacher_plots_stu1.7b_teacher8b_answeronly/
+opsd*/
+output/
 # Distribution / packaging
 .Python
 build/

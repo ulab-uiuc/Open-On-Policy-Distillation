@@ -13,6 +13,7 @@ from slime.utils.misc import load_function
 from slime.utils.ppo_utils import (
     calculate_log_probs_and_entropy,
     compute_approx_kl,
+    compute_log_probs,
     compute_gspo_kl,
     compute_opsm_mask,
     compute_policy_loss,
@@ -380,18 +381,73 @@ def apply_opd_kl_to_advantages(
     if student_log_probs is None:
         return
 
-    teacher_log_probs = rollout_data.get("teacher_log_probs")
-    if teacher_log_probs is None:
-        raise ValueError(f"OPD with opd_type='{args.opd_type}' requires teacher_log_probs, but it is missing.")
-
+    kl_mode = getattr(args, "opd_kl_mode", "token_reverse_kl")
     device = student_log_probs[0].device
-    teacher_log_probs = [t.to(device=device) for t in teacher_log_probs]
+
+    def _compute_topk_tail_reverse_kl(
+        student_topk_lp: torch.Tensor,
+        teacher_topk_lp: torch.Tensor,
+        eps: float = 1e-8,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Inputs are log probabilities over the full vocabulary, restricted to
+        # student top-k token positions: [response_len, k].
+        p_s = student_topk_lp.exp()
+        p_t = teacher_topk_lp.exp()
+
+        p_s_mass = p_s.sum(dim=-1).clamp(min=0.0, max=1.0)
+        p_t_mass = p_t.sum(dim=-1).clamp(min=0.0, max=1.0)
+
+        kl_topk = (p_s * (student_topk_lp - teacher_topk_lp)).sum(dim=-1)
+        p_s_tail = (1.0 - p_s_mass).clamp(min=eps)
+        p_t_tail = (1.0 - p_t_mass).clamp(min=eps)
+        kl_tail = p_s_tail * (p_s_tail.log() - p_t_tail.log())
+        return kl_topk + kl_tail, p_s_mass, p_t_mass
 
     reverse_kls = []
-    for i, adv in enumerate(advantages):
-        reverse_kl = student_log_probs[i] - teacher_log_probs[i]
-        advantages[i] = adv - args.opd_kl_coef * reverse_kl
-        reverse_kls.append(reverse_kl)
+    if kl_mode == "full_vocab_topk_reverse_kl":
+        student_topk = rollout_data.get("opd_topk_student_log_probs")
+        teacher_topk = rollout_data.get("opd_topk_teacher_log_probs")
+        if student_topk is None or teacher_topk is None:
+            raise ValueError(
+                "OPD full_vocab_topk_reverse_kl requires opd_topk_student_log_probs and "
+                "opd_topk_teacher_log_probs in rollout_data."
+            )
+        student_topk = [t.to(device=device) for t in student_topk]
+        teacher_topk = [t.to(device=device) for t in teacher_topk]
+
+        topk_student_mass = []
+        topk_teacher_mass = []
+        topk_tail_kl = []
+        for i, adv in enumerate(advantages):
+            if student_topk[i].dim() != 2 or teacher_topk[i].dim() != 2:
+                raise ValueError(
+                    "OPD top-k tensors must be rank-2 [response_len, k]. "
+                    f"Got {student_topk[i].shape} and {teacher_topk[i].shape}."
+                )
+            if student_topk[i].shape != teacher_topk[i].shape:
+                raise ValueError(
+                    "Student/teacher top-k tensor shape mismatch: "
+                    f"{student_topk[i].shape} vs {teacher_topk[i].shape}."
+                )
+            reverse_kl, ps_mass, pt_mass = _compute_topk_tail_reverse_kl(student_topk[i], teacher_topk[i])
+            advantages[i] = adv - args.opd_kl_coef * reverse_kl
+            reverse_kls.append(reverse_kl)
+            topk_student_mass.append(ps_mass)
+            topk_teacher_mass.append(pt_mass)
+            topk_tail_kl.append(reverse_kl - (student_topk[i].exp() * (student_topk[i] - teacher_topk[i])).sum(dim=-1))
+
+        rollout_data["opd_topk_student_mass"] = topk_student_mass
+        rollout_data["opd_topk_teacher_mass"] = topk_teacher_mass
+        rollout_data["opd_topk_tail_kl"] = topk_tail_kl
+    else:
+        teacher_log_probs = rollout_data.get("teacher_log_probs")
+        if teacher_log_probs is None:
+            raise ValueError(f"OPD with opd_type='{args.opd_type}' requires teacher_log_probs, but it is missing.")
+        teacher_log_probs = [t.to(device=device) for t in teacher_log_probs]
+        for i, adv in enumerate(advantages):
+            reverse_kl = student_log_probs[i] - teacher_log_probs[i]
+            advantages[i] = adv - args.opd_kl_coef * reverse_kl
+            reverse_kls.append(reverse_kl)
 
     # Store reverse KL for logging
     rollout_data["opd_reverse_kl"] = reverse_kls
@@ -659,6 +715,7 @@ def policy_loss_function(
     )
 
     log_probs = log_probs_and_entropy["log_probs"]
+    log_probs_list = log_probs
 
     # Pre-gather log probs if needed by OPSM or GSPO to avoid duplicate gathering
     need_full_log_probs = args.use_opsm or args.advantage_estimator == "gspo"
@@ -803,12 +860,147 @@ def policy_loss_function(
     # so that tokens with large training-inference mismatch contribute less to the JSD gradient.
     # RS rejection (modified_response_masks) is already baked into sum_of_sample_mean above.
     if args.use_opd and args.opd_type == "opsd" and args.opsd_jsd_coef > 0 and "opsd_jsd_values" in batch:
-        opsd_jsd = torch.cat(batch["opsd_jsd_values"], dim=0)
+        opsd_jsd_list = batch["opsd_jsd_values"]
+
+        # -- Optional: length-normalized reduction --
+        # Weight each sample by (L_i / L_mean) so longer responses contribute
+        # proportionally more KL loss, creating an implicit length penalty.
+        if getattr(args, "opsd_kl_length_normalize", False):
+            loss_masks_list = batch["loss_masks"]
+            token_counts = [mask.sum().item() for mask in loss_masks_list]
+            total_tokens = sum(token_counts)
+            n_samples = len(opsd_jsd_list)
+            if total_tokens > 0:
+                length_weights = [tc * n_samples / total_tokens for tc in token_counts]
+            else:
+                length_weights = [1.0] * n_samples
+            opsd_jsd_list = [jsd_i * w for jsd_i, w in zip(opsd_jsd_list, length_weights)]
+
+        # -- Optional: position decay --
+        # Suppress KL gradient at late token positions to break the length-explosion
+        # feedback loop in forward KL training.  Token at absolute position t receives
+        # weight exp(-alpha * t / max_len).  This prevents the teacher's low-EOS
+        # probability at late positions from being propagated to the student, allowing
+        # the student to assign higher EOS probability there and produce shorter rollouts.
+        _position_decay = getattr(args, "opsd_kl_position_decay", 0.0)
+        if _position_decay > 0.0:
+            _max_len = float(getattr(args, "rollout_max_response_len", 8192) or 8192)
+            decayed = []
+            for jsd_i in opsd_jsd_list:
+                L = jsd_i.size(0)
+                if L > 0:
+                    t = torch.arange(L, dtype=torch.float32, device=jsd_i.device)
+                    decay_weights = torch.exp(-_position_decay * t / _max_len)
+                    decayed.append(jsd_i * decay_weights)
+                else:
+                    decayed.append(jsd_i)
+            opsd_jsd_list = decayed
+
+        opsd_jsd = torch.cat(opsd_jsd_list, dim=0)
         if opsd_is_weights_flat is not None:
             # IS-weight the per-token JSD contributions (same weights used for pg_loss).
             opsd_jsd = opsd_jsd * opsd_is_weights_flat
         opsd_jsd_loss = sum_of_sample_mean(opsd_jsd)
         loss = loss + args.opsd_jsd_coef * opsd_jsd_loss
+
+    # OPD-SGLang: optional explicit distillation loss (coef * loss), in addition to
+    # the advantage-side OPD term. This makes OPD support an explicit additive form
+    # similar to OPSD's coef * distillation_loss.
+    opd_explicit_loss = None
+    if (
+        args.use_opd
+        and getattr(args, "opd_type", None) == "sglang"
+        and getattr(args, "opd_explicit_loss_coef", 0.0) > 0
+    ):
+        kl_mode = getattr(args, "opd_kl_mode", "token_reverse_kl")
+        if kl_mode == "token_reverse_kl":
+            if "teacher_log_probs" not in batch:
+                raise ValueError(
+                    "OPD explicit token_reverse_kl requires teacher_log_probs in batch, but it is missing."
+                )
+            teacher_lp = torch.cat(batch["teacher_log_probs"], dim=0)
+            opd_explicit_values = log_probs - teacher_lp
+            opd_explicit_loss = sum_of_sample_mean(opd_explicit_values)
+        elif kl_mode == "full_vocab_topk_reverse_kl":
+            if "opd_topk_token_ids" not in batch or "opd_topk_teacher_log_probs" not in batch:
+                raise ValueError(
+                    "OPD explicit full_vocab_topk_reverse_kl requires opd_topk_token_ids and "
+                    "opd_topk_teacher_log_probs in batch."
+                )
+
+            tp_group = mpu.get_tensor_model_parallel_group()
+            eps = 1e-8
+            per_sample_kl = []
+            response_iter = get_responses(
+                logits,
+                args=args,
+                unconcat_tokens=batch["unconcat_tokens"],
+                total_lengths=total_lengths,
+                response_lengths=response_lengths,
+                max_seq_lens=max_seq_lens,
+            )
+            for i, (student_logits_i, _) in enumerate(response_iter):
+                topk_ids_i = batch["opd_topk_token_ids"][i]
+                teacher_topk_lp_i = batch["opd_topk_teacher_log_probs"][i]
+
+                if topk_ids_i.numel() == 0:
+                    per_sample_kl.append(torch.zeros((0,), dtype=torch.float32, device=student_logits_i.device))
+                    continue
+
+                if topk_ids_i.dim() != 2 or teacher_topk_lp_i.dim() != 2:
+                    raise ValueError(
+                        "OPD top-k explicit loss expects rank-2 tensors [response_len, k]. "
+                        f"Got ids={topk_ids_i.shape}, teacher_lp={teacher_topk_lp_i.shape}."
+                    )
+                if topk_ids_i.shape != teacher_topk_lp_i.shape:
+                    raise ValueError(
+                        "OPD top-k explicit loss shape mismatch between ids and teacher log-probs: "
+                        f"{topk_ids_i.shape} vs {teacher_topk_lp_i.shape}."
+                    )
+                if student_logits_i.size(0) != topk_ids_i.size(0):
+                    raise ValueError(
+                        "OPD top-k explicit loss response length mismatch: "
+                        f"student_logits={student_logits_i.size(0)}, topk={topk_ids_i.size(0)}."
+                    )
+
+                k = topk_ids_i.size(1)
+                current_student_lp_cols = []
+                for j in range(k):
+                    lp_col = compute_log_probs(
+                        student_logits_i.float().clone(),
+                        topk_ids_i[:, j].long(),
+                        tp_group,
+                    ).squeeze(-1)
+                    current_student_lp_cols.append(lp_col)
+                current_student_lp = torch.stack(current_student_lp_cols, dim=-1)
+
+                teacher_topk_lp_i = teacher_topk_lp_i.float().to(device=current_student_lp.device)
+                p_s = current_student_lp.exp()
+                p_t = teacher_topk_lp_i.exp()
+                kl_topk = (p_s * (current_student_lp - teacher_topk_lp_i)).sum(dim=-1)
+                p_s_tail = (1.0 - p_s.sum(dim=-1)).clamp(min=eps)
+                p_t_tail = (1.0 - p_t.sum(dim=-1)).clamp(min=eps)
+                kl_tail = p_s_tail * (p_s_tail.log() - p_t_tail.log())
+                per_sample_kl.append(kl_topk + kl_tail)
+
+            opd_explicit_values = torch.cat(per_sample_kl, dim=0)
+            opd_explicit_loss = sum_of_sample_mean(opd_explicit_values)
+        else:
+            raise ValueError(f"Unsupported --opd-kl-mode for explicit OPD loss: {kl_mode}")
+
+        loss = loss + args.opd_explicit_loss_coef * opd_explicit_loss
+
+    # OPSD: position-weighted EOS encouragement loss
+    # loss_t = -(t / max_len) * log p_S(EOS | context_t), pre-computed in the forward pass.
+    # Encourages the student to assign higher EOS probability at later positions,
+    # directly counteracting length explosion without modifying the JSD objective.
+    if args.use_opd and args.opd_type == "opsd" and getattr(args, "opsd_eos_loss_coef", 0.0) > 0 and "opsd_eos_values" in batch:
+        opsd_eos = torch.cat(batch["opsd_eos_values"], dim=0)
+        opsd_eos_loss = sum_of_sample_mean(opsd_eos)
+        loss = loss + args.opsd_eos_loss_coef * opsd_eos_loss
+
+    # kl_biased_ppo: per-token loss values are stored in opsd_jsd_values and consumed
+    # by the regular OPSD JSD path above (lines ~805-847).  No special treatment needed.
 
     if args.use_kl_loss:
         ref_log_probs = batch["ref_log_probs"]
@@ -865,16 +1057,36 @@ def policy_loss_function(
     if "opd_reverse_kl" in batch:
         opd_reverse_kl = torch.cat(batch["opd_reverse_kl"], dim=0)
         reported_loss["opd_reverse_kl"] = sum_of_sample_mean(opd_reverse_kl).clone().detach()
+    if opd_explicit_loss is not None:
+        reported_loss["opd_explicit_loss"] = opd_explicit_loss.clone().detach()
 
-    # Add OPSD JSD metrics if available
+    # Add OPSD JSD / KL-biased-PPO metrics if available
     if "opsd_jsd_values" in batch:
         opsd_jsd = torch.cat(batch["opsd_jsd_values"], dim=0)
-        reported_loss["opsd_jsd"] = sum_of_sample_mean(opsd_jsd).clone().detach()
+        if getattr(args, "opsd_loss_type", "jsd") == "kl_biased_ppo":
+            reported_loss["kl_biased_ppo_loss"] = sum_of_sample_mean(opsd_jsd).clone().detach()
+        else:
+            reported_loss["opsd_jsd"] = sum_of_sample_mean(opsd_jsd).clone().detach()
 
     # Add Wiener gate weight metrics if available (wiener_kl loss type only)
     if "opsd_wiener_weights" in batch:
         wiener_w = torch.cat(batch["opsd_wiener_weights"], dim=0)
         reported_loss["opsd_wiener_weight"] = sum_of_sample_mean(wiener_w).clone().detach()
+
+    # Add EOS loss metric if available
+    if "opsd_eos_values" in batch:
+        opsd_eos = torch.cat(batch["opsd_eos_values"], dim=0)
+        reported_loss["opsd_eos_loss"] = sum_of_sample_mean(opsd_eos).clone().detach()
+
+    # Fraction of tokens where entropy gate fired (kl_biased_ppo only)
+    if "opsd_gate_values" in batch:
+        gate_vals = torch.cat(batch["opsd_gate_values"], dim=0)
+        reported_loss["kl_biased_ppo_gate_frac"] = sum_of_sample_mean(gate_vals).clone().detach()
+
+    # Fraction of tokens clipped by opsd_token_clip
+    if "opsd_clip_fracs" in batch:
+        clip_vals = torch.cat(batch["opsd_clip_fracs"], dim=0)
+        reported_loss["opsd_token_clip_frac"] = sum_of_sample_mean(clip_vals).clone().detach()
 
     return loss, reported_loss
 

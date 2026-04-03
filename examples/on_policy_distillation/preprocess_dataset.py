@@ -80,6 +80,31 @@ _BOXED_FORMAT_INSTRUCTION = (
 # Keep the legacy name as an alias so other code that imported _DAPO_FORMAT_INSTRUCTION still works.
 _DAPO_FORMAT_INSTRUCTION = _ANSWER_FORMAT_INSTRUCTION
 
+# Prefix / suffix used by the DAPO dataset's baked-in format instruction.
+# These are used to strip the wrapper and recover the bare problem text so that
+# --answer-format can be applied uniformly across all dataset types.
+_DAPO_BAKED_PREFIX = (
+    "Solve the following math problem step by step. "
+    "The last line of your response should be of the form "
+    "Answer: $Answer (without quotes) where $Answer is the answer to the problem.\n\n"
+)
+_DAPO_BAKED_SUFFIX = "\n\nRemember to put your answer on its own line after \"Answer:\"."
+
+
+def _strip_dapo_format(content: str) -> str | None:
+    """Try to strip the baked-in DAPO format wrapper and return the bare problem.
+
+    Returns None if the content does not match the expected DAPO template
+    (so the caller can fall back to keeping the original content unchanged).
+    """
+    if not content.startswith(_DAPO_BAKED_PREFIX):
+        return None
+    s = content[len(_DAPO_BAKED_PREFIX):]
+    if s.endswith(_DAPO_BAKED_SUFFIX):
+        s = s[: -len(_DAPO_BAKED_SUFFIX)]
+    return s.strip()
+
+
 # Short tail-only strings stored in metadata['format_instruction'].
 # Used by the teacher prompt builder in on_policy_self_distillation.py so the
 # teacher always appends the same format instruction as the student.
@@ -159,8 +184,11 @@ def _extract_dapo(row: dict):
     reward_model = _safe_literal(row.get("reward_model", {}))
     label = _normalize(reward_model.get("ground_truth", "")) if isinstance(reward_model, dict) else ""
 
-    # raw problem = student content (already includes format instruction)
-    problem_raw = student_user_content
+    # Try to strip the baked-in DAPO format instruction to recover the bare problem text.
+    # If stripping fails (non-standard DAPO variant), problem_raw is left empty so the
+    # main preprocess() loop knows to keep student_user_content as-is.
+    stripped = _strip_dapo_format(student_user_content)
+    problem_raw = stripped if stripped is not None else ""
     source = _normalize(row.get("data_source", "dapo"))
     return problem_raw, student_user_content, label, "", source
 
@@ -309,16 +337,16 @@ def preprocess(
                 skipped += 1
                 continue
 
-            # For formats that expose a bare problem (openthoughts, simple, generic),
-            # rebuild student_user_content using the chosen answer-format template.
-            # DAPO content is pre-formatted by the dataset and is left unchanged.
-            if detected != "dapo" and problem_raw:
+            # If we have a bare problem text (either from a non-DAPO dataset or from
+            # successfully stripping the DAPO baked-in format instruction), rebuild
+            # student_user_content using the chosen --answer-format template.
+            # If stripping failed (non-standard DAPO variant), problem_raw is empty and
+            # we keep student_user_content as-is (always Answer: style in that case).
+            if problem_raw:
                 student_user_content = fmt_template.format(problem=problem_raw)
                 effective_fmt_suffix = fmt_suffix
             else:
-                # DAPO: format instruction is baked into the dataset content (always Answer: style).
-                # Override fmt_suffix so metadata['format_instruction'] matches what the student
-                # actually sees, regardless of what --answer-format was passed.
+                # DAPO with unrecognised format wrapper: keep original content unchanged.
                 effective_fmt_suffix = _FORMAT_SUFFIX["answer"]
 
             entry = {
@@ -365,8 +393,8 @@ def main():
             "Format instruction style appended to each problem. "
             "'answer' (default): DAPO style – model outputs 'Answer: <value>' on the last line. "
             "'boxed': LaTeX style – model wraps its final answer in \\boxed{}. "
-            "Note: DAPO datasets already embed the format instruction; this flag affects "
-            "openthoughts, simple, and generic formats only."
+            "For DAPO datasets the baked-in format instruction is automatically stripped "
+            "and replaced with the chosen style."
         ),
     )
     args = parser.parse_args()

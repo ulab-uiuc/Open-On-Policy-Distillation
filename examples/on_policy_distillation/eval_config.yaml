@@ -21,18 +21,18 @@ eval:
       n_samples_per_eval_prompt: 1
       apply_chat_template_kwargs:
         enable_thinking: false
-    - name: hmmt
-      path: /root/math/data/eval_hmmt.jsonl
-      rm_type: math
-      n_samples_per_eval_prompt: 1
-      apply_chat_template_kwargs:
-        enable_thinking: false
-    - name: amo_bench
-      path: /root/math/data/eval_amo_bench.jsonl
-      rm_type: math
-      n_samples_per_eval_prompt: 1
-      apply_chat_template_kwargs:
-        enable_thinking: false
+    # - name: hmmt
+    #   path: /root/math/data/eval_hmmt.jsonl
+    #   rm_type: math
+    #   n_samples_per_eval_prompt: 1
+    #   apply_chat_template_kwargs:
+    #     enable_thinking: true
+    # - name: amo_bench
+    #   path: /root/math/data/eval_amo_bench.jsonl
+    #   rm_type: math
+    #   n_samples_per_eval_prompt: 1
+    #   apply_chat_template_kwargs:
+    #     enable_thinking: true
     - name: math500
       path: /root/math/data/eval_math500.jsonl
       rm_type: math

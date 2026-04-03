@@ -69,7 +69,7 @@ ROLLOUT_ARGS=(
    --input-key prompt
    --label-key label
    --apply-chat-template
-   --apply-chat-template-kwargs '{"enable_thinking":false}'
+   --apply-chat-template-kwargs '{"enable_thinking":true}'
    --rollout-shuffle
    --num-rollout 300
    --rollout-batch-size 32
@@ -89,7 +89,7 @@ RM_ARGS=(
 )
 
 EVAL_ARGS=(
-    --eval-interval 20
+    --eval-interval 5
     --eval-config examples/on_policy_distillation/eval_config.yaml
     --log-passrate
 )
@@ -127,11 +127,18 @@ GRPO_ARGS=(
    --entropy-coef 0.00
 
    --use-kl-loss
-   --kl-loss-coef 0.0
+   --kl-loss-coef 0.05
 
    --use-tis
    --tis-clip 2.0
    --tis-clip-low 0.0
+
+   # length normalization
+   # --opsd-kl-length-normalize
+   # --opsd-kl-position-decay 2.0
+   # --opsd-eos-loss-coef 0.01
+   # --opsd-eos-token-id 151645
+   # --opsd-kl-max-len 4096
 )
 
 OPTIMIZER_ARGS=(
@@ -147,7 +154,7 @@ OPTIMIZER_ARGS=(
 WANDB_ARGS=(
    --use-wandb
    --wandb-project slime-dev
-   --wandb-group qwen3-1.7B-opsd_pi-forward_kl+ref_kl-answeronly-openthoughts-kl0
+   --wandb-group qwen3-1.7B-opsd_pi-forward_kl+ref_kl-answeronly-openthoughts-kl05-enablethinking
    --wandb-key 2ed6f8544ac3e30d5c08879166cc10d9c6232448
 )
 
@@ -187,8 +194,8 @@ ray job submit --address="http://127.0.0.1:8265" \
    }' \
    -- python3 train.py \
    --actor-num-nodes 1 \
-   --actor-num-gpus-per-node 4 \
-   --rollout-num-gpus 4 \
+   --actor-num-gpus-per-node 2 \
+   --rollout-num-gpus 6 \
    ${MODEL_ARGS[@]} \
    ${CKPT_ARGS[@]} \
    ${ROLLOUT_ARGS[@]} \

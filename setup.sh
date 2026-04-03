@@ -106,3 +106,38 @@ git rm -r --cached data
 
 export NCCL_P2P_DISABLE=1
 export NCCL_IB_DISABLE=1
+
+
+
+CUDA_VISIBLE_DEVICES=3,6,7,8 python3 -m sglang.launch_server --model-path /root/checkpoints_siqi/Qwen3-1.7B --port 30000 --host 0.0.0.0 --tp 1
+
+CUDA_VISIBLE_DEVICES=7 python3 -m sglang.launch_server --model-path /root/checkpoints_siqi/Qwen3-8B --port 30001 --host 0.0.0.0 --tp 1
+CUDA_VISIBLE_DEVICES=8 python3 -m sglang.launch_server --model-path /root/checkpoints_siqi/Qwen3-1.7B --port 30002 --host 0.0.0.0 --tp 1
+
+
+kill -9 $(lsof -t -i :13141)
+
+python examples/on_policy_distillation/plot_token_winner_interactive.py \                                                             
+    --input ./eval_math500_student_teacher_inference.jsonl \
+    --output ./token_winner_interactive.html \
+    --n-bins 200 \
+    --max-requests 500
+
+python examples/on_policy_distillation/plot_token_winner_interactive.py \
+  --input ./eval_math500_student_teacher_inference.jsonl
+
+
+python examples/on_policy_distillation/plot_token_winner_interactive.py \
+  --input ./eval_math500_student_teacher_inference_s1.7t8b_noanswer_v2.jsonl \
+  --output ./token_winner_interactive.html \
+  --tokenizer Qwen/Qwen3-1.7B \
+  --show-last-k-tokens 64
+
+
+
+python examples/on_policy_distillation/plot_token_winner_interactive.py \
+  --input ./eval_math500_student_teacher_inference_s1.7t8b_answeronly.jsonl \
+  --output ./token_winner_interactive.html \
+  --tokenizer Qwen/Qwen3-1.7B \
+  --show-last-k-tokens 64
+

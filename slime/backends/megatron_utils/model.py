@@ -338,13 +338,21 @@ def _compute_opsd_jsd_in_forward(
     from megatron.core.packed_seq_params import PackedSeqParams
 
     from slime.utils.ppo_utils import (
+        compute_decoded_sequence_kl,
+        compute_log_probs,
         compute_vocab_parallel_forward_kl,
         compute_vocab_parallel_jsd,
+        compute_vocab_parallel_kl_biased_ppo_advantage,
         compute_vocab_parallel_reverse_kl,
+        compute_vocab_parallel_topk_forward_kl,
+        compute_vocab_parallel_topk_tail_kl,
         compute_vocab_parallel_wiener_kl,
     )
 
     loss_type = getattr(args, "opsd_loss_type", "jsd")
+    _eos_loss_coef = getattr(args, "opsd_eos_loss_coef", 0.0)
+    _eos_token_id = getattr(args, "opsd_eos_token_id", -1)
+    _compute_eos_loss = _eos_loss_coef > 0.0 and _eos_token_id >= 0
 
     teacher_tokens_list = batch["teacher_tokens"]  # list of [L_i] long tensors on GPU
     teacher_prompt_lengths = batch["teacher_prompt_lengths"]  # list of int
@@ -420,7 +428,11 @@ def _compute_opsd_jsd_in_forward(
 
     # ---- Compute per-sample JSD on response tokens ----
     opsd_jsd_values = []
-    opsd_wiener_weights = []  # only populated when loss_type == "wiener_kl"
+    opsd_wiener_weights = []   # only populated when loss_type == "wiener_kl"
+    opsd_eos_values = []       # only populated when opsd_eos_loss_coef > 0
+    opsd_gate_values = []      # only populated when loss_type == "kl_biased_ppo"
+    opsd_clip_fracs = []       # only populated when opsd_token_clip > 0
+    _eos_max_len = float(getattr(args, "rollout_max_response_len", 8192) or 8192)
     student_end = 0
     teacher_end = 0
     for i in range(len(response_lengths)):
@@ -443,10 +455,18 @@ def _compute_opsd_jsd_in_forward(
         # (teacher_tokens = privileged_prompt + student_response, so [t_prompt_len:] = response)
         response_tokens_i = teacher_tokens_list[i][t_prompt_len : t_prompt_len + resp_len]  # [resp_len]
 
-        # Per-sample wiener gate accumulator (wiener_kl only).
+        # Per-sample accumulator for side-channel outputs (wiener_kl, kl_biased_ppo).
         wiener_w_chunks = []
+        gate_chunks = []  # kl_biased_ppo only: per-chunk gate indicators
 
         # Compute distribution-matching loss on smaller chunks to cap peak memory.
+        _needs_response_tokens = loss_type in ("wiener_kl", "decoded_kl")
+        _topk = getattr(args, "opsd_topk", 50)
+        _topk_source = getattr(args, "opsd_topk_source", "teacher")
+        _kl_ppo_eta = float(getattr(args, "opsd_kl_ppo_eta", 1.0))
+        _kl_ppo_tau = float(getattr(args, "opsd_kl_ppo_tau", 0.0))
+        _kl_ppo_topk = _topk  # reuses --opsd-topk
+
         def _compute_loss_chunk(
             s_chunk: torch.Tensor,
             t_chunk: torch.Tensor,
@@ -469,6 +489,20 @@ def _compute_opsd_jsd_in_forward(
                 chunk_loss, w = compute_vocab_parallel_wiener_kl(s_chunk, t_chunk, tok_chunk, tp_group)
                 wiener_w_chunks.append(w.detach())
                 return chunk_loss
+            elif loss_type == "topk_forward_kl":
+                return compute_vocab_parallel_topk_forward_kl(s_chunk, t_chunk, _topk, tp_group, _topk_source)
+            elif loss_type == "topk_tail_kl":
+                return compute_vocab_parallel_topk_tail_kl(s_chunk, t_chunk, _topk, tp_group)
+            elif loss_type == "decoded_kl":
+                assert tok_chunk is not None, "decoded_kl requires response_tokens"
+                return compute_decoded_sequence_kl(s_chunk, t_chunk, tok_chunk, tp_group)
+            elif loss_type == "kl_biased_ppo":
+                # Returns (per-token loss, per-token gate indicator).
+                chunk_loss, chunk_gate = compute_vocab_parallel_kl_biased_ppo_advantage(
+                    s_chunk, t_chunk, _kl_ppo_topk, _kl_ppo_eta, _kl_ppo_tau, tp_group
+                )
+                gate_chunks.append(chunk_gate.detach())
+                return chunk_loss
             else:  # default: jsd
                 return compute_vocab_parallel_jsd(s_chunk, t_chunk, tp_group, beta=args.opsd_jsd_beta)
 
@@ -476,7 +510,7 @@ def _compute_opsd_jsd_in_forward(
             loss_chunks = []
             for chunk_start in range(0, resp_len, jsd_chunk_size):
                 chunk_end = min(chunk_start + jsd_chunk_size, resp_len)
-                tok_chunk = response_tokens_i[chunk_start:chunk_end] if loss_type == "wiener_kl" else None
+                tok_chunk = response_tokens_i[chunk_start:chunk_end] if _needs_response_tokens else None
                 loss_chunks.append(_compute_loss_chunk(
                     s_logits[chunk_start:chunk_end],
                     t_logits[chunk_start:chunk_end],
@@ -484,16 +518,62 @@ def _compute_opsd_jsd_in_forward(
                 ))
             jsd = torch.cat(loss_chunks, dim=0)
         else:
-            tok_arg = response_tokens_i if loss_type == "wiener_kl" else None
+            tok_arg = response_tokens_i if _needs_response_tokens else None
             jsd = _compute_loss_chunk(s_logits, t_logits, tok_arg)
 
         if wiener_w_chunks:
             opsd_wiener_weights.append(torch.cat(wiener_w_chunks, dim=0))
+        if gate_chunks:
+            opsd_gate_values.append(torch.cat(gate_chunks, dim=0))
+
+        # ---- Hard KL truncation (optional) ----
+        # Zero out JSD contributions beyond kl_max_len.  Unlike position decay which
+        # gradually reduces the weight, this completely removes the "keep generating"
+        # gradient signal beyond the cutoff, preventing the forward KL from training
+        # the model to continue at positions > kl_max_len.
+        _kl_max_len = getattr(args, "opsd_kl_max_len", -1)
+        if _kl_max_len > 0 and resp_len > _kl_max_len:
+            jsd = torch.cat([jsd[:_kl_max_len], torch.zeros(resp_len - _kl_max_len, dtype=jsd.dtype, device=jsd.device)])
+
+        # ---- Per-token value clipping (optional) ----
+        # Clamp each token's divergence to prevent high-divergence tokens (e.g. style
+        # tokens) from dominating the gradient signal over content tokens.
+        _token_clip = getattr(args, "opsd_token_clip", -1.0)
+        if _token_clip is not None and _token_clip > 0:
+            opsd_clip_fracs.append((jsd.detach() > _token_clip).float())
+            jsd = jsd.clamp(max=_token_clip)
+
         opsd_jsd_values.append(jsd)
+
+        # ---- EOS encouragement loss (optional) ----
+        # Compute -log p_S(EOS | context_t) * (t / max_len) for each response position.
+        # Uses raw (non-temperature-scaled) student logits so the loss targets the
+        # policy's natural next-token distribution at inference temperature=1.
+        if _compute_eos_loss and resp_len > 0:
+            eos_tok = torch.full(
+                (resp_len,), _eos_token_id, dtype=torch.long, device=s_logits.device
+            )
+            # compute_log_probs returns [resp_len, 1]; squeeze to [resp_len].
+            # fused_vocab_parallel_cross_entropy modifies logits in-place during
+            # forward, so clone() is required to avoid corrupting the student logits
+            # that are still needed for the main policy-loss backward pass.
+            eos_logprobs = compute_log_probs(
+                s_logits.float().clone(), eos_tok, tp_group
+            ).squeeze(-1)  # log p_S(EOS | context_t)
+            t_pos = torch.arange(resp_len, dtype=torch.float32, device=s_logits.device)
+            pos_weights = t_pos / _eos_max_len  # 0 at position 0, ~1 at max_len
+            eos_loss_per_token = -eos_logprobs * pos_weights  # [resp_len]
+            opsd_eos_values.append(eos_loss_per_token)
 
     batch["opsd_jsd_values"] = opsd_jsd_values
     if opsd_wiener_weights:
         batch["opsd_wiener_weights"] = opsd_wiener_weights
+    if opsd_eos_values:
+        batch["opsd_eos_values"] = opsd_eos_values
+    if opsd_gate_values:
+        batch["opsd_gate_values"] = opsd_gate_values
+    if opsd_clip_fracs:
+        batch["opsd_clip_fracs"] = opsd_clip_fracs
 
 
 def _prefetch_opsd_teacher_logits(
@@ -651,6 +731,8 @@ def train_one_step(
                 "rollout_log_probs",
                 "max_seq_lens",
                 "teacher_log_probs",
+                "opd_topk_token_ids",
+                "opd_topk_teacher_log_probs",
                 "teacher_tokens",
                 "teacher_prompt_lengths",
             ],

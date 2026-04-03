@@ -27,6 +27,11 @@ class Sample:
     rollout_routed_experts: list[list[int]] | None = None  # Routed experts from rollout engine
     remove_sample: bool = False
     teacher_log_probs: list[float] | None = None  # Log probabilities from teacher model for OPD
+    # OPD-SGLang full-vocab top-k reverse KL support:
+    # per-response-position top-k token log-probs under student / teacher.
+    opd_topk_token_ids: list[list[int]] | None = None
+    opd_topk_student_log_probs: list[list[float]] | None = None
+    opd_topk_teacher_log_probs: list[list[float]] | None = None
     teacher_tokens: list[int] | None = None  # Full token sequence for OPSD teacher (privileged prompt + student response)
     teacher_prompt_length: int | None = None  # Length of the privileged prompt in teacher_tokens (for OPSD)
 

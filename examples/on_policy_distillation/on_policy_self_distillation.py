@@ -113,6 +113,49 @@ def _get_mask_token(tokenizer) -> str:
     return mask_token if mask_token else _FALLBACK_MASK_TOKEN
 
 
+def _build_hidden_think_prefix_tokens(
+    tokenizer, user_content: str, think_content: str, max_think_tokens: int = -1
+) -> list[int]:
+    """Build teacher prefix tokens with privileged info hidden inside a <think> block.
+
+    The resulting token sequence is:
+        [chat_template ... <think>\\n] + think_content + "\\n</think>\\n"
+
+    The caller appends student response tokens to form sample.teacher_tokens and
+    sets sample.teacher_prompt_length = len(returned list).
+
+    This always uses enable_thinking=True for the teacher so the generation prompt
+    ends with "<think>\\n" regardless of what the student uses.  The student is
+    expected to run with enable_thinking=False (no <think> tokens in its response).
+
+    Args:
+        max_think_tokens: If > 0, truncate think_content at this many tokens before
+            embedding it in the think block.  Use this to prevent OOM when
+            think_content is a long reference reasoning chain (hidden_think_full).
+            -1 (default) means no limit.
+    """
+    messages = [{"role": "user", "content": user_content}]
+    try:
+        think_open_text = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True, enable_thinking=True
+        )
+    except TypeError:
+        # Tokenizer does not support enable_thinking; fall back without it.
+        think_open_text = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+
+    # Optionally truncate think_content at the token level to avoid OOM from
+    # very long reference solutions (e.g. OpenThoughts-114k DeepSeek chains).
+    if max_think_tokens > 0 and think_content:
+        think_ids = tokenizer.encode(think_content, add_special_tokens=False)
+        if len(think_ids) > max_think_tokens:
+            think_content = tokenizer.decode(think_ids[-max_think_tokens:], skip_special_tokens=True)
+
+    prefix_text = think_open_text + think_content + "\n</think>\n"
+    return tokenizer.encode(prefix_text, add_special_tokens=False)
+
+
 def _mask_reference_solution(
     text: str,
     tokenizer,
@@ -227,11 +270,28 @@ def post_process_rewards(args, samples, **kwargs):
     _chat_template_kwargs: dict = {}
     _raw_kwargs = getattr(args, "apply_chat_template_kwargs", None)
     if _raw_kwargs:
-        try:
-            _chat_template_kwargs = json.loads(_raw_kwargs)
-        except Exception:
-            pass
+        if isinstance(_raw_kwargs, dict):
+            _chat_template_kwargs = _raw_kwargs
+        else:
+            try:
+                _chat_template_kwargs = json.loads(_raw_kwargs)
+            except Exception:
+                pass
     _teacher_enable_thinking: bool = _chat_template_kwargs.get("enable_thinking", True)
+    _teacher_think_max_tokens: int = int(getattr(args, "opsd_teacher_think_max_tokens", -1))
+
+    # # Debug: log _teacher_enable_thinking to verify it is correctly derived.
+    # _debug_msg = (
+    #     f"[OPSD DEBUG] apply_chat_template_kwargs raw type={type(_raw_kwargs).__name__}, "
+    #     f"value={_raw_kwargs!r}\n"
+    #     f"[OPSD DEBUG] _chat_template_kwargs={_chat_template_kwargs!r}\n"
+    #     f"[OPSD DEBUG] _teacher_enable_thinking={_teacher_enable_thinking}\n"
+    # )
+    # logger.info(_debug_msg)
+    # import os as _os
+    # _debug_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "debug_teacher_enable_thinking.txt")
+    # with open(_debug_path, "a") as _f:
+    #     _f.write(_debug_msg)
 
     # Per-sample format_instruction is read from metadata below; this is only
     # used as a last-resort fallback when the field is missing from metadata.
@@ -276,10 +336,78 @@ def post_process_rewards(args, samples, **kwargs):
 
         # ------------------------------------------------------------------
         # Build privileged teacher prompt based on teacher_info_mode.
-        # The teacher always uses the same answer-format instruction as the
-        # student (read from metadata['format_instruction']).
+        #
+        # Standard modes (answer_only / masked_reasoning / pi / conciseness / full):
+        #   Set teacher_user_content; the bottom of the loop applies the chat
+        #   template uniformly with enable_thinking=_teacher_enable_thinking.
+        #
+        # hidden_think modes (hidden_think / hidden_think_full):
+        #   Set teacher_prompt_tokens directly (bypassing apply_chat_template).
+        #   The teacher always uses enable_thinking=True so its generation prefix
+        #   ends with "<think>\n"; privileged info is then prepended inside the
+        #   think block, followed by "</think>\n".  The student is expected to run
+        #   with enable_thinking=False (no <think> tokens in its response).
         # ------------------------------------------------------------------
-        if teacher_info_mode == "answer_only":
+        teacher_user_content = None     # used by standard modes
+        teacher_prompt_tokens = None    # used by hidden_think modes (skips template step)
+
+        if _teacher_enable_thinking and teacher_info_mode in ("hidden_think", "hidden_think_full"):
+            logger.warning(
+                "OPSD: hidden_think mode is designed for student enable_thinking=False "
+                "(--apply-chat-template-kwargs '{\"enable_thinking\":false}'). "
+                "Detected enable_thinking=True for the student; the student response "
+                "will contain <think> tokens which may cause a token-distribution mismatch."
+            )
+
+        if teacher_info_mode == "hidden_think":
+            # Privileged answer hint hidden inside the teacher's <think> block.
+            # Both teacher and student receive the identical user message; the only
+            # difference is that the teacher's generation context is prefilled with
+            # the answer inside <think>…</think> before the student response tokens.
+            # This tests whether "silent" knowledge of the answer can be distilled
+            # into a student that never uses the thinking mode.
+            student_user_content = metadata.get("student_user_content") or raw_content
+            answer_hint = label if label else reference_solution
+            if answer_hint:
+                # Wrap in \boxed{} when the dataset uses boxed answer format so the
+                # hint matches the output format the model is trained to produce.
+                if "boxed" in format_instruction:
+                    formatted_answer = f"\\boxed{{{answer_hint}}}"
+                else:
+                    formatted_answer = answer_hint
+                think_content = f"The answer to this problem is {formatted_answer}."
+            else:
+                think_content = ""
+            _debug_msg = (
+                f"[OPSD DEBUG] teacher_user_content={student_user_content}\n"
+                f"[OPSD DEBUG] think_content={think_content}\n"
+            )
+            logger.info(_debug_msg)
+            teacher_prompt_tokens = _build_hidden_think_prefix_tokens(
+                tokenizer, student_user_content, think_content,
+                max_think_tokens=_teacher_think_max_tokens,
+            )
+
+        elif teacher_info_mode == "hidden_think_full":
+            # Full reference reasoning chain hidden inside the teacher's <think> block.
+            # Requires a dataset that provides reference_solution (e.g. OpenThoughts-114k).
+            # When reference_solution is empty, the think block is left empty and the
+            # teacher degrades to the same context as the student.
+            # Use --opsd-teacher-think-max-tokens to cap very long reference solutions
+            # and prevent OOM (recommended: 4096 for OpenThoughts-114k).
+            student_user_content = metadata.get("student_user_content") or raw_content
+            think_content = reference_solution  # may be empty for eval-only datasets
+            _debug_msg = (
+                f"[OPSD DEBUG] teacher_user_content={student_user_content}\n"
+                f"[OPSD DEBUG] think_content={think_content}\n"
+            )
+            logger.info(_debug_msg)
+            teacher_prompt_tokens = _build_hidden_think_prefix_tokens(
+                tokenizer, student_user_content, think_content,
+                max_think_tokens=_teacher_think_max_tokens,
+            )
+
+        elif teacher_info_mode == "answer_only":
             # Teacher only gets the final answer, not the full reasoning chain.
             # We still frame it as "here is the answer, now solve it yourself"
             # so the teacher stays in the response distribution.
@@ -392,24 +520,22 @@ def post_process_rewards(args, samples, **kwargs):
             else:
                 teacher_user_content = f"{raw_content}\n\n{format_instruction}"
 
-        teacher_messages = [
-            {"role": "user", "content": teacher_user_content},
-        ]
-
-        # Tokenize teacher prompt. add_generation_prompt=True keeps assistant turn open.
-        # enable_thinking must match --apply-chat-template-kwargs used for student rollout.
-        # Mismatching would cause a systematic KL error at the very first token
-        # (teacher prompt ending with <think>\n while student response has no <think>).
-        teacher_prompt_text = tokenizer.apply_chat_template(
-            teacher_messages, tokenize=False, add_generation_prompt=True,
-            enable_thinking=_teacher_enable_thinking
-        )
-        teacher_prompt_tokens = tokenizer.encode(teacher_prompt_text, add_special_tokens=False)
-
         # Student response tokens (last response_length tokens of the full sequence)
         response_tokens = sample.tokens[-sample.response_length:]
 
-        # Teacher tokens = privileged prompt + student response
+        if teacher_prompt_tokens is None:
+            # Standard path: apply chat template to the user-content string set above.
+            # enable_thinking must match --apply-chat-template-kwargs used for student
+            # rollout to avoid a systematic KL mismatch at the very first token
+            # (teacher prompt ending with <think>\n while student response has no <think>).
+            teacher_messages = [{"role": "user", "content": teacher_user_content}]
+            teacher_prompt_text = tokenizer.apply_chat_template(
+                teacher_messages, tokenize=False, add_generation_prompt=True,
+                enable_thinking=_teacher_enable_thinking
+            )
+            teacher_prompt_tokens = tokenizer.encode(teacher_prompt_text, add_special_tokens=False)
+
+        # Teacher tokens = privileged prefix + student response
         sample.teacher_tokens = teacher_prompt_tokens + list(response_tokens)
         sample.teacher_prompt_length = len(teacher_prompt_tokens)
 

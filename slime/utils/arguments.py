@@ -994,6 +994,38 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="On-policy distillation KL penalty coefficient. Default is 1.0.",
             )
             parser.add_argument(
+                "--opd-kl-mode",
+                type=str,
+                choices=["token_reverse_kl", "full_vocab_topk_reverse_kl"],
+                default="token_reverse_kl",
+                help=(
+                    "KL mode for OPD-SGLang. "
+                    "'token_reverse_kl' (default): token-level reverse KL on sampled trajectory, "
+                    "using student/teacher log-probs of decoded tokens only. "
+                    "'full_vocab_topk_reverse_kl': top-k tail approximation of reverse KL that reuses "
+                    "student top-k support and teacher log-probs on the same token set."
+                ),
+            )
+            parser.add_argument(
+                "--opd-topk",
+                type=int,
+                default=50,
+                help=(
+                    "Top-k used by --opd-kl-mode=full_vocab_topk_reverse_kl. "
+                    "Must be positive. Default is 50."
+                ),
+            )
+            parser.add_argument(
+                "--opd-explicit-loss-coef",
+                type=float,
+                default=0.0,
+                help=(
+                    "Explicit OPD loss coefficient added directly to actor loss in OPD-SGLang mode. "
+                    "When > 0, an additional distillation term is added on top of policy gradient "
+                    "(similar to OPSD's explicit coef*loss form). Default 0.0 (disabled)."
+                ),
+            )
+            parser.add_argument(
                 "--opd-teacher-load",
                 type=str,
                 default=None,
@@ -1005,6 +1037,37 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--opd-teacher-ckpt-step", type=int, default=None, help="The checkpoint step for OPD teacher model."
             )
+            parser.add_argument(
+                "--opd-teacher-info-mode",
+                type=str,
+                choices=["same_as_student", "answer_only"],
+                default="same_as_student",
+                help=(
+                    "Teacher prompt mode for external-teacher OPD (mainly --opd-type=sglang). "
+                    "'same_as_student' (default): teacher sees exactly the same prompt tokens as student. "
+                    "'answer_only': teacher receives privileged answer-only hint appended to the student user prompt, "
+                    "following the OPSD answer_only construction."
+                ),
+            )
+            parser.add_argument(
+                "--opd-teacher-tokenizer",
+                type=str,
+                default=None,
+                help=(
+                    "Tokenizer source used to build teacher prompt input_ids for OPD-SGLang privileged prompt modes "
+                    "(e.g. --opd-teacher-info-mode=answer_only). "
+                    "Defaults to --hf-checkpoint when unset."
+                ),
+            )
+            parser.add_argument(
+                "--opd-zero-task-reward",
+                action="store_true",
+                default=False,
+                help=(
+                    "When enabled, set scalar task rewards to zero in OPD-SGLang reward post-processing. "
+                    "Policy updates are then driven by OPD KL only while raw task reward metrics are still logged."
+                ),
+            )
             # OPSD-specific arguments
             parser.add_argument(
                 "--opsd-jsd-coef",
@@ -1015,7 +1078,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--opsd-loss-type",
                 type=str,
-                choices=["jsd", "reverse_kl", "forward_kl", "wiener_kl"],
+                choices=["jsd", "reverse_kl", "forward_kl", "wiener_kl", "topk_forward_kl", "topk_tail_kl", "decoded_kl", "kl_biased_ppo"],
                 default="jsd",
                 help=(
                     "Type of token-level distribution matching loss for OPSD. Default is 'jsd'. "
@@ -1031,7 +1094,52 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "  sampled token and H_t^T is the teacher entropy. "
                     "  Loss = w_t * KL(pi_S || pi_T) + (1 - w_t) * KL(pi_T || pi_S). "
                     "  Gate is large when teacher strongly supports y_t with low uncertainty. "
-                    "Note: --opsd-jsd-beta is only used when --opsd-loss-type=jsd."
+                    "'topk_forward_kl': Partial forward KL at top-k token positions. "
+                    "  Both teacher and student use full-vocab normalisation (same scale as forward_kl). "
+                    "  Top-k source is controlled by --opsd-topk-source; k by --opsd-topk. "
+                    "'topk_tail_kl': Approximate reverse KL(student || teacher) with top-K exact terms "
+                    "  plus a single tail bucket (SDPO eq.11). Top-K selected from student. "
+                    "  KL_approx = Σ_{top-K(S)} p_S·log(p_S/p_T) + p_S_tail·log(p_S_tail/p_T_tail). "
+                    "  Same numerical scale as reverse_kl; memory O(k) instead of O(V). "
+                    "'decoded_kl': Per-token KL at the actually decoded (sampled) tokens. "
+                    "  kl_t = log p_T(y_t) - log p_S(y_t) -- a 1-sample Monte Carlo KL estimate. "
+                    "  Pushes student to assign higher probability to the decoded sequence without "
+                    "  a full-vocabulary all-reduce; much cheaper than full-vocab KL modes. "
+                    "'kl_biased_ppo': KL-Form Forward-Biased PPO-OPSD. "
+                    "  Computes a per-token advantage A_t = -KL(pi_old||pi_te) - eta*1[H_te>tau]*KL(tilde_pi_te||pi_old) "
+                    "  where tilde_pi_te is the teacher renormalized on its global top-k support. "
+                    "  Normalizes A_t and applies a PPO clipped surrogate as an auxiliary loss. "
+                    "  Loss coefficient reuses --opsd-jsd-coef; top-k reuses --opsd-topk. "
+                    "  Parameters: --opsd-kl-ppo-eta (eta), --opsd-kl-ppo-tau (tau). "
+                    "Note: --opsd-jsd-beta is only used when --opsd-loss-type=jsd. "
+                    "      --opsd-topk is used by topk_forward_kl and topk_tail_kl. "
+                    "      --opsd-topk-source is only used when --opsd-loss-type=topk_forward_kl."
+                ),
+            )
+            parser.add_argument(
+                "--opsd-topk",
+                type=int,
+                default=50,
+                help=(
+                    "Number of top tokens to retain when --opsd-loss-type=topk_forward_kl. "
+                    "Which model's logits are used to select top-k is controlled by --opsd-topk-source. "
+                    "Larger k approaches full-vocab forward KL; smaller k focuses on the most probable tokens. "
+                    "Default is 50."
+                ),
+            )
+            parser.add_argument(
+                "--opsd-topk-source",
+                type=str,
+                choices=["teacher", "student"],
+                default="teacher",
+                help=(
+                    "Which model's logits to use for selecting top-k indices in topk_forward_kl. "
+                    "'teacher' (default): use teacher top-k as support; computes KL(p_T_topk || p_S). "
+                    "  Focuses distillation on what the teacher is most confident about. "
+                    "'student': use student top-k as support; computes KL(p_T_student_topk || p_S) "
+                    "  where teacher is renormalised over the student's top-k positions. "
+                    "  Focuses distillation gradient on the region where the student currently places mass. "
+                    "Only used when --opsd-loss-type=topk_forward_kl."
                 ),
             )
             parser.add_argument(
@@ -1039,6 +1147,27 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=float,
                 default=0.5,
                 help="Interpolation weight for JSD mixture distribution: m = beta*p_T + (1-beta)*p_S. Default 0.5.",
+            )
+            parser.add_argument(
+                "--opsd-kl-ppo-eta",
+                type=float,
+                default=1.0,
+                help=(
+                    "Weight eta for the forward-KL correction term in kl_biased_ppo loss. "
+                    "Controls the strength of the top-k forward KL relative to the reverse KL. "
+                    "Only used when --opsd-loss-type=kl_biased_ppo. Default 1.0."
+                ),
+            )
+            parser.add_argument(
+                "--opsd-kl-ppo-tau",
+                type=float,
+                default=0.0,
+                help=(
+                    "Teacher entropy threshold tau for the entropy gate in kl_biased_ppo loss. "
+                    "The forward-KL term is applied only when H_te > tau (teacher is uncertain enough). "
+                    "Set to 0 to always apply the forward-KL correction. "
+                    "Only used when --opsd-loss-type=kl_biased_ppo. Default 0.0."
+                ),
             )
             parser.add_argument(
                 "--opsd-pure-mode",
@@ -1060,7 +1189,8 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--opsd-teacher-info-mode",
                 type=str,
-                choices=["full", "answer_only", "masked_reasoning", "conciseness", "pi"],
+                choices=["full", "answer_only", "masked_reasoning", "conciseness", "pi",
+                         "hidden_think", "hidden_think_full"],
                 default="full",
                 help=(
                     "Controls how much information the teacher receives in its privileged prompt, "
@@ -1074,7 +1204,14 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "from the reasoning portion. "
                     "'conciseness': OPSDC mode (arXiv 2603.05433) -- teacher receives a conciseness instruction "
                     "prepended to the original problem; NO ground-truth solution is needed. "
-                    "Use with --opsd-loss-type=reverse_kl and --opsd-pure-mode for full OPSDC training."
+                    "Use with --opsd-loss-type=reverse_kl and --opsd-pure-mode for full OPSDC training. "
+                    "'hidden_think': teacher receives the SAME user message as the student, but the privileged "
+                    "answer hint ('The answer to this problem is X.') is prefilled into the teacher's <think> "
+                    "block before the student response tokens. The student must run with enable_thinking=False. "
+                    "Tests whether silent knowledge of the answer distils into a no-think student. "
+                    "'hidden_think_full': like hidden_think but the full reference reasoning chain is placed "
+                    "inside <think> instead of just the answer. Requires a dataset with reference_solution "
+                    "(e.g. OpenThoughts-114k). Degrades gracefully to an empty think block when unavailable."
                 ),
             )
             parser.add_argument(
@@ -1102,6 +1239,105 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "The teacher sees this instruction + the original problem; "
                     "the student sees only the original problem. "
                     "Used by OPSDC (arXiv 2603.05433) for ground-truth-free reasoning compression."
+                ),
+            )
+            parser.add_argument(
+                "--opsd-teacher-think-max-tokens",
+                type=int,
+                default=-1,
+                help=(
+                    "Maximum number of tokens allowed inside the <think> block of the teacher's "
+                    "privileged prefix when --opsd-teacher-info-mode=hidden_think_full. "
+                    "If the reference solution exceeds this limit it is truncated at the token level "
+                    "before being embedded in the think block, preventing excessively long teacher "
+                    "sequences from causing OOM. "
+                    "-1 (default) means no limit. "
+                    "Recommended: set to 4096 when training on OpenThoughts-114k to keep total "
+                    "teacher sequence length (prompt + think + response) within model context."
+                ),
+            )
+            parser.add_argument(
+                "--opsd-kl-length-normalize",
+                action="store_true",
+                default=False,
+                help=(
+                    "When enabled, weight each sample's OPSD KL/JSD loss contribution by its response "
+                    "length relative to the mean response length in the batch. Concretely, sample i is "
+                    "scaled by (L_i / L_mean) before the per-sample mean reduction, so the total loss "
+                    "becomes N * mean_per_token_KL_across_all_batch_tokens instead of the default "
+                    "sum_i[mean_t(KL_t^i)] (where each sample contributes equally regardless of length). "
+                    "This creates an implicit length penalty: longer responses incur proportionally more "
+                    "KL loss, which can help counteract monotonic length growth during late-stage training."
+                ),
+            )
+            parser.add_argument(
+                "--opsd-kl-position-decay",
+                type=float,
+                default=0.0,
+                help=(
+                    "Exponential position decay coefficient for per-token OPSD KL/JSD loss weights. "
+                    "When > 0, the token at absolute position t (0-indexed) in the response is weighted "
+                    "by exp(-alpha * t / rollout_max_response_len), where alpha is this value. "
+                    "Early tokens keep near-full weight; late tokens approach zero weight. "
+                    "This breaks the length-explosion feedback loop inherent in forward KL training: "
+                    "without decay, the teacher's low EOS probability at late positions is propagated "
+                    "to the student via KL, discouraging EOS and encouraging longer sequences; with "
+                    "decay, the gradient at late positions is suppressed so the student is free to "
+                    "assign higher EOS probability there, naturally producing shorter rollouts. "
+                    "Suggested range: 1.0–5.0 (alpha=2, max_len=8192 → position 4096 gets weight "
+                    "exp(-1)≈0.37; position 8192 gets exp(-2)≈0.14). "
+                    "Default 0.0 (disabled). Compatible with --opsd-kl-length-normalize."
+                ),
+            )
+            parser.add_argument(
+                "--opsd-eos-loss-coef",
+                type=float,
+                default=0.0,
+                help=(
+                    "Coefficient for the position-weighted EOS encouragement loss. "
+                    "When > 0, adds a term that directly trains the student to assign higher "
+                    "probability to the EOS token at each response position, with weight "
+                    "proportional to the token's position: loss_t = -(t / max_len) * log p_S(EOS | t). "
+                    "This creates a direct gradient pressure to stop earlier: early positions "
+                    "(t≈0) contribute near-zero loss regardless of EOS probability; late positions "
+                    "(t→max_len) contribute a strong penalty for low EOS probability. "
+                    "Requires --opsd-eos-token-id to be set. "
+                    "Default 0.0 (disabled)."
+                ),
+            )
+            parser.add_argument(
+                "--opsd-eos-token-id",
+                type=int,
+                default=-1,
+                help=(
+                    "Token ID of the EOS token used by --opsd-eos-loss-coef. "
+                    "Must be set to a non-negative value when --opsd-eos-loss-coef > 0. "
+                    "For Qwen3 / Qwen2.5 models the EOS token is <|im_end|> = 151645. "
+                    "Default -1 (disabled)."
+                ),
+            )
+            parser.add_argument(
+                "--opsd-kl-max-len",
+                type=int,
+                default=-1,
+                help=(
+                    "Hard truncation of the per-token KL/JSD loss beyond this response position. "
+                    "Tokens at positions >= opsd-kl-max-len receive zero KL gradient, completely "
+                    "removing the 'keep generating' signal from forward KL at late positions. "
+                    "When combined with --opsd-eos-loss-coef, the EOS loss provides the only "
+                    "gradient signal beyond this cutoff, directly encouraging earlier stopping. "
+                    "Default -1 (disabled, no truncation)."
+                ),
+            )
+            parser.add_argument(
+                "--opsd-token-clip",
+                type=float,
+                default=-1.0,
+                help=(
+                    "Per-token clipping of the KL/JSD loss value. Each token's divergence is clamped "
+                    "to this maximum before reduction, preventing high-divergence tokens (e.g. style "
+                    "tokens) from dominating the gradient signal over content tokens. "
+                    "Default -1.0 (disabled, no clipping)."
                 ),
             )
             return parser
@@ -1664,6 +1900,8 @@ def slime_validate_args(args):
             raise ValueError("--opd-type must be specified when --use-opd is enabled. Choose 'sglang' or 'megatron'.")
 
         if args.opd_type == "megatron":
+            if getattr(args, "opd_kl_mode", "token_reverse_kl") != "token_reverse_kl":
+                raise ValueError("--opd-kl-mode only supports --opd-type=sglang.")
             if args.opd_teacher_load is None:
                 raise ValueError(
                     "--opd-teacher-load is required when --opd-type=megatron. "
@@ -1685,8 +1923,13 @@ def slime_validate_args(args):
                     "--opd-teacher-load should not be set when --opd-type=sglang. "
                     "In sglang mode, teacher log-probs are obtained from external server during rollout."
                 )
+            if getattr(args, "opd_kl_mode", "token_reverse_kl") == "full_vocab_topk_reverse_kl":
+                if getattr(args, "opd_topk", 0) <= 0:
+                    raise ValueError("--opd-topk must be > 0 when --opd-kl-mode=full_vocab_topk_reverse_kl.")
 
         elif args.opd_type == "opsd":
+            if getattr(args, "opd_kl_mode", "token_reverse_kl") != "token_reverse_kl":
+                raise ValueError("--opd-kl-mode only supports --opd-type=sglang.")
             if args.opd_teacher_load is not None:
                 raise ValueError(
                     "--opd-teacher-load should not be set when --opd-type=opsd. "
@@ -1700,6 +1943,13 @@ def slime_validate_args(args):
         # If OPD is not enabled, opd_teacher_load should not be set
         if args.opd_teacher_load is not None:
             raise ValueError("--opd-teacher-load is set but --use-opd is not enabled. Please add --use-opd flag.")
+        if getattr(args, "opd_kl_mode", "token_reverse_kl") != "token_reverse_kl":
+            raise ValueError("--opd-kl-mode is set but --use-opd is not enabled.")
+        if getattr(args, "opd_explicit_loss_coef", 0.0) > 0:
+            raise ValueError("--opd-explicit-loss-coef is set but --use-opd is not enabled.")
+
+    if getattr(args, "opd_explicit_loss_coef", 0.0) > 0 and getattr(args, "opd_type", None) != "sglang":
+        raise ValueError("--opd-explicit-loss-coef currently only supports --opd-type=sglang.")
 
     if args.megatron_to_hf_mode == "bridge":
         if (

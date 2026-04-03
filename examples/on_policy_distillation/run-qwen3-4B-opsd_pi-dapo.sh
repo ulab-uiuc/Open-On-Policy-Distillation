@@ -4,15 +4,18 @@
 # Training dataset: BytedTsinghua-SIA/DAPO-Math-17k
 #
 # Teacher mode: answer_only
-#   - Student: DAPO-formatted problem (Answer: $Answer style, baked into dataset)
+#   - Student: formatted problem (style controlled by TRAIN_ANSWER_FORMAT)
 #   - Teacher: same student_user_content + ground-truth answer hint
 #   - Loss: forward KL + pg_loss + ref KL
 #
-# Note: DAPO datasets embed the "Answer: $Answer" format instruction directly in the
-# prompt text. TRAIN_ANSWER_FORMAT is ignored for DAPO (preprocess_dataset.py detects
-# this and always stores the Answer: suffix in metadata['format_instruction']).
+# TRAIN_ANSWER_FORMAT controls the format instruction appended to each problem:
+#   "answer" (default) – DAPO style: model outputs "Answer: <value>" on the last line.
+#   "boxed"            – LaTeX style: model wraps its final answer in \boxed{}.
+# preprocess_dataset.py strips the baked-in DAPO format instruction and replaces it
+# with the chosen style, so both values work correctly with the DAPO dataset.
 #
 # Usage: bash examples/on_policy_distillation/run-qwen3-4B-opsd_pi-dapo.sh
+# Usage (boxed): TRAIN_ANSWER_FORMAT=boxed bash examples/on_policy_distillation/run-qwen3-4B-opsd_pi-dapo.sh
 
 set -ex
 export NCCL_P2P_DISABLE=1
@@ -43,10 +46,8 @@ TRAIN_DATASET="${TRAIN_DATASET:-BytedTsinghua-SIA/DAPO-Math-17k}"
 TRAIN_CONFIG="${TRAIN_CONFIG:-}"   # DAPO does not require a config subset
 TRAIN_OUT="/root/math/data/train_dapo.jsonl"
 
-# DAPO format instruction is baked into the dataset; TRAIN_ANSWER_FORMAT is
-# effectively ignored for DAPO (preprocess_dataset.py always uses Answer: style).
 # EVAL datasets use boxed by default.
-TRAIN_ANSWER_FORMAT="${TRAIN_ANSWER_FORMAT:-answer}"
+TRAIN_ANSWER_FORMAT="${TRAIN_ANSWER_FORMAT:-boxed}"
 EVAL_ANSWER_FORMAT="${EVAL_ANSWER_FORMAT:-boxed}"
 
 TRAIN_ARGS=(--dataset "$TRAIN_DATASET" --split train --output "$TRAIN_OUT" --answer-format "$TRAIN_ANSWER_FORMAT")
@@ -140,6 +141,9 @@ GRPO_ARGS=(
    --use-tis
    --tis-clip 2.0
    --tis-clip-low 0.0
+
+   # length normalization
+   --opsd-kl-length-normalize
 )
 
 OPTIMIZER_ARGS=(
@@ -155,7 +159,7 @@ OPTIMIZER_ARGS=(
 WANDB_ARGS=(
    --use-wandb
    --wandb-project slime-dev
-   --wandb-group qwen3-1.7B-opsd_pi-forward_kl+ref_kl-answeronly-dapo
+   --wandb-group qwen3-1.7B-opsd_pi-forward_kl+ref_kl-answeronly-dapo-batchlengthnorm
    --wandb-key 2ed6f8544ac3e30d5c08879166cc10d9c6232448
 )
 

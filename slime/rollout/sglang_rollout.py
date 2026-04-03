@@ -36,6 +36,72 @@ __all__ = ["generate_rollout"]
 logger = logging.getLogger(__name__)
 
 
+def _extract_scalar_logprob(value: Any) -> float:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        return float(value)
+    if isinstance(value, (list, tuple)):
+        if not value:
+            raise ValueError("Empty logprob entry.")
+        return _extract_scalar_logprob(value[0])
+    if isinstance(value, dict):
+        if "logprob" in value:
+            return _extract_scalar_logprob(value["logprob"])
+        if "value" in value:
+            return _extract_scalar_logprob(value["value"])
+    raise ValueError(f"Unsupported logprob value format: {type(value)}")
+
+
+def _parse_top_logprobs_entry(raw_entry: Any, topk: int) -> tuple[list[int], list[float]]:
+    if raw_entry is None:
+        raise ValueError("top_logprobs entry is None.")
+
+    pairs: list[tuple[int, float]] = []
+    if isinstance(raw_entry, dict):
+        for k, v in raw_entry.items():
+            token_id = int(k)
+            logp = _extract_scalar_logprob(v)
+            pairs.append((token_id, logp))
+    elif isinstance(raw_entry, (list, tuple)):
+        for item in raw_entry:
+            if isinstance(item, dict):
+                token_id = item.get("token_id", item.get("id", item.get("token")))
+                if token_id is None:
+                    continue
+                pairs.append((int(token_id), _extract_scalar_logprob(item)))
+            elif isinstance(item, (list, tuple)):
+                if len(item) >= 2:
+                    # Common forms: [logprob, token_id, ...] or [token_id, logprob]
+                    a, b = item[0], item[1]
+                    try:
+                        # Prefer [logprob, token_id] format used by sglang entries.
+                        token_id = int(b)
+                        logp = _extract_scalar_logprob(a)
+                    except Exception:
+                        token_id = int(a)
+                        logp = _extract_scalar_logprob(b)
+                    pairs.append((token_id, logp))
+    else:
+        raise ValueError(f"Unsupported top_logprobs format: {type(raw_entry)}")
+
+    if not pairs:
+        raise ValueError("No token-logprob pairs found in top_logprobs entry.")
+
+    # Deduplicate by keeping the highest logprob per token id.
+    dedup: dict[int, float] = {}
+    for tid, lp in pairs:
+        if tid not in dedup or lp > dedup[tid]:
+            dedup[tid] = lp
+    sorted_pairs = sorted(dedup.items(), key=lambda x: x[1], reverse=True)
+    selected = sorted_pairs[:topk]
+    if len(selected) < topk:
+        raise ValueError(f"top_logprobs has only {len(selected)} entries, expected at least {topk}.")
+    token_ids = [p[0] for p in selected]
+    logps = [p[1] for p in selected]
+    return token_ids, logps
+
+
 class GenerateState(metaclass=SingletonMeta):
     """
     The global state for the generation process.
@@ -142,6 +208,12 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         "sampling_params": sampling_params,
         "return_logprob": True,
     }
+    if (
+        args.use_opd
+        and getattr(args, "opd_type", None) == "sglang"
+        and getattr(args, "opd_kl_mode", "token_reverse_kl") == "full_vocab_topk_reverse_kl"
+    ):
+        payload["top_logprobs_num"] = int(getattr(args, "opd_topk", 50))
 
     if args.use_rollout_routing_replay:
         payload["return_routed_experts"] = True
@@ -175,6 +247,29 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
             new_response_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
         else:
             new_response_tokens, new_response_log_probs = [], []
+
+        if (
+            args.use_opd
+            and getattr(args, "opd_type", None) == "sglang"
+            and getattr(args, "opd_kl_mode", "token_reverse_kl") == "full_vocab_topk_reverse_kl"
+        ):
+            if "output_token_logprobs" not in output["meta_info"]:
+                raise ValueError(
+                    "OPD full_vocab_topk_reverse_kl requires `meta_info.output_token_logprobs`, but it is missing."
+                )
+            topk = int(getattr(args, "opd_topk", 50))
+            if sample.opd_topk_token_ids is None:
+                sample.opd_topk_token_ids = []
+            if sample.opd_topk_student_log_probs is None:
+                sample.opd_topk_student_log_probs = []
+            for pos, item in enumerate(output["meta_info"]["output_token_logprobs"]):
+                if not isinstance(item, (list, tuple)) or len(item) < 3:
+                    raise ValueError(
+                        "OPD full_vocab_topk_reverse_kl requires top_logprobs in output_token_logprobs entries."
+                    )
+                top_token_ids, top_logps = _parse_top_logprobs_entry(item[2], topk)
+                sample.opd_topk_token_ids.append(top_token_ids)
+                sample.opd_topk_student_log_probs.append(top_logps)
 
         # Update sample with tokens directly - avoiding re-tokenization
         sample.tokens = sample.tokens + new_response_tokens
@@ -563,6 +658,7 @@ async def eval_rollout_single_dataset(
             "rewards": [sample.reward if not reward_key else sample.reward[reward_key] for sample in data],
             "truncated": [sample.status == Sample.Status.TRUNCATED for sample in data],
             "samples": data,
+            "n_samples_per_eval_prompt": dataset_cfg.n_samples_per_eval_prompt,
         }
     }
 

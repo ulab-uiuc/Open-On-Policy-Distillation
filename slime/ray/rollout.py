@@ -579,6 +579,12 @@ class RolloutManager:
 
         if samples[0].teacher_log_probs is not None:
             train_data["teacher_log_probs"] = [sample.teacher_log_probs for sample in samples]
+        if getattr(samples[0], "opd_topk_token_ids", None) is not None:
+            train_data["opd_topk_token_ids"] = [sample.opd_topk_token_ids for sample in samples]
+        if getattr(samples[0], "opd_topk_student_log_probs", None) is not None:
+            train_data["opd_topk_student_log_probs"] = [sample.opd_topk_student_log_probs for sample in samples]
+        if getattr(samples[0], "opd_topk_teacher_log_probs", None) is not None:
+            train_data["opd_topk_teacher_log_probs"] = [sample.opd_topk_teacher_log_probs for sample in samples]
 
         # OPSD: pack teacher tokens and teacher prompt lengths
         if getattr(samples[0], "teacher_tokens", None) is not None:
@@ -625,6 +631,9 @@ class RolloutManager:
                 "rollout_routed_experts",
                 "prompt",
                 "teacher_log_probs",
+                "opd_topk_token_ids",
+                "opd_topk_student_log_probs",
+                "opd_topk_teacher_log_probs",
                 "teacher_tokens",
                 "teacher_prompt_lengths",
             ]:
@@ -865,9 +874,6 @@ def start_rollout_server(args, pg) -> RolloutServer:
     )
 
 
-_COMBINED_EVAL_KEYS = {"aime24", "aime25", "hmmt", "amo_bench"}
-
-
 def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any] | None = None):
     if args.custom_eval_rollout_log_function_path is not None:
         custom_log_func = load_function(args.custom_eval_rollout_log_function_path)
@@ -875,36 +881,32 @@ def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any]
             return
 
     log_dict = extra_metrics or {}
-    combined_rewards: list[float] = []
+    all_rewards: list[float] = []
+    per_dataset_accs: list[float] = []
     for key in data.keys():
         rewards = data[key]["rewards"]
-        log_dict[f"eval/{key}"] = sum(rewards) / len(rewards)
+        dataset_acc = sum(rewards) / len(rewards)
+        log_dict[f"eval/{key}"] = dataset_acc
         if (samples := data[key].get("samples")) is not None:
             log_dict |= dict_add_prefix(compute_metrics_from_samples(args, samples), f"eval/{key}/")
         if "truncated" in data[key]:
             truncated = data[key]["truncated"]
             log_dict[f"eval/{key}-truncated_ratio"] = sum(truncated) / len(truncated)
         if args.log_passrate:
+            group_size = data[key].get("n_samples_per_eval_prompt") or args.n_samples_per_eval_prompt
             log_dict |= dict_add_prefix(
                 compute_pass_rate(
                     flat_rewards=rewards,
-                    group_size=args.n_samples_per_eval_prompt,
+                    group_size=group_size,
                 ),
                 f"eval/{key}-",
             )
-        if key in _COMBINED_EVAL_KEYS:
-            combined_rewards.extend(rewards)
+        all_rewards.extend(rewards)
+        per_dataset_accs.append(dataset_acc)
 
-    if combined_rewards:
-        log_dict["eval/combined"] = sum(combined_rewards) / len(combined_rewards)
-        if args.log_passrate:
-            log_dict |= dict_add_prefix(
-                compute_pass_rate(
-                    flat_rewards=combined_rewards,
-                    group_size=args.n_samples_per_eval_prompt,
-                ),
-                "eval/combined-",
-            )
+    if all_rewards:
+        log_dict["eval/combined_micro"] = sum(all_rewards) / len(all_rewards)
+        log_dict["eval/combined_macro"] = sum(per_dataset_accs) / len(per_dataset_accs)
 
     logger.info(f"eval {rollout_id}: {log_dict}")
 
@@ -938,6 +940,34 @@ def compute_metrics_from_samples(args, samples):
 
     log_dict = {}
     log_dict |= dict_add_prefix(compute_statistics(response_lengths), "response_len/")
+    # Task-reward diagnostics (works for custom RM dict rewards and scalar rewards).
+    task_rewards = []
+    strict_rewards = []
+    relaxed_rewards = []
+    strict_relaxed_gap = 0
+    for sample in samples:
+        try:
+            task_rewards.append(float(sample.get_reward_value(args)))
+        except Exception:
+            if isinstance(sample.reward, (int, float)):
+                task_rewards.append(float(sample.reward))
+        if isinstance(sample.reward, dict):
+            s_val = sample.reward.get("accuracy_strict")
+            r_val = sample.reward.get("accuracy_relaxed")
+            if s_val is not None:
+                strict_rewards.append(float(s_val))
+            if r_val is not None:
+                relaxed_rewards.append(float(r_val))
+            if s_val is not None and r_val is not None and float(s_val) == 0.0 and float(r_val) == 1.0:
+                strict_relaxed_gap += 1
+    if task_rewards:
+        log_dict["task_reward_mean"] = float(np.mean(task_rewards))
+    if strict_rewards:
+        log_dict["reward/accuracy_strict"] = float(np.mean(strict_rewards))
+    if relaxed_rewards:
+        log_dict["reward/accuracy_relaxed"] = float(np.mean(relaxed_rewards))
+    if strict_rewards and relaxed_rewards:
+        log_dict["reward/strict_relaxed_gap_rate"] = strict_relaxed_gap / len(samples)
     log_dict |= _compute_zero_std_metrics(args, samples)
     log_dict |= _compute_reward_cat_metrics(args, samples)
     log_dict["repetition_frac"] = np.mean([int(has_repetition(s.response)) for s in samples]).item()
