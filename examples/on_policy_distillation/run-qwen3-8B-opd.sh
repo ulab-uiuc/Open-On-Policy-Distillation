@@ -3,6 +3,7 @@
 # usage: bash examples/on_policy_distillation/run-qwen3-8B-opd.sh
 
 set -ex
+OPD_DISTILL_MAX_RESPONSE_LEN="${OPD_DISTILL_MAX_RESPONSE_LEN:-2048}"
 
 
 # Start the teacher model server
@@ -105,6 +106,7 @@ GRPO_ARGS=(
    --advantage-estimator grpo
    --use-opd
    --opd-type sglang
+   --opd-distill-max-response-len "${OPD_DISTILL_MAX_RESPONSE_LEN}"
    --opd-kl-coef 1.0
    --use-kl-loss
    --kl-loss-coef 0.00

@@ -27,6 +27,8 @@ class Sample:
     rollout_routed_experts: list[list[int]] | None = None  # Routed experts from rollout engine
     remove_sample: bool = False
     teacher_log_probs: list[float] | None = None  # Log probabilities from teacher model for OPD
+    teacher_logprob_mask: list[int] | None = None  # Mask for valid teacher log-prob positions
+    opd_distill_sample_mask: int | None = None  # 1 if sample participates in OPD distillation, else 0
     # OPD-SGLang full-vocab top-k reverse KL support:
     # per-response-position top-k token log-probs under student / teacher.
     opd_topk_token_ids: list[list[int]] | None = None
@@ -151,7 +153,9 @@ class Sample:
         return sample
 
     def get_reward_value(self, args) -> float:
-        return self.reward if not args.reward_key else self.reward[args.reward_key]
+        if args.reward_key and isinstance(self.reward, dict):
+            return self.reward[args.reward_key]
+        return self.reward
 
     @property
     def effective_response_length(self):

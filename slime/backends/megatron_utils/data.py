@@ -424,6 +424,7 @@ def log_rollout_data(
                 "teacher_prompt_lengths",
                 # OPD top-k index payload
                 "opd_topk_token_ids",
+                "teacher_logprob_mask",
             ]:
                 continue
             # Upload per sample mean for each rollout value

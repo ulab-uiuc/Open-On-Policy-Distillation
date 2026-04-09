@@ -19,6 +19,7 @@
 OPD_KL_MODE="token_reverse_kl"
 OPD_TOPK="50"
 OPD_EXPLICIT_LOSS_COEF="1.0"
+OPD_DISTILL_MAX_RESPONSE_LEN="${OPD_DISTILL_MAX_RESPONSE_LEN:-2048}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -34,9 +35,13 @@ while [[ $# -gt 0 ]]; do
             OPD_EXPLICIT_LOSS_COEF="$2"
             shift 2
             ;;
+        --opd-distill-max-response-len)
+            OPD_DISTILL_MAX_RESPONSE_LEN="$2"
+            shift 2
+            ;;
         *)
             echo "Unknown argument: $1"
-            echo "Supported args: --opd-kl-mode <token_reverse_kl|full_vocab_topk_reverse_kl> --opd-topk <int> --opd-explicit-loss-coef <float>"
+            echo "Supported args: --opd-kl-mode <token_reverse_kl|full_vocab_topk_reverse_kl> --opd-topk <int> --opd-explicit-loss-coef <float> --opd-distill-max-response-len <-1|int>"
             exit 1
             ;;
     esac
@@ -54,7 +59,11 @@ if ! [[ "${OPD_EXPLICIT_LOSS_COEF}" =~ ^-?[0-9]+([.][0-9]+)?$ ]]; then
     echo "Invalid --opd-explicit-loss-coef: ${OPD_EXPLICIT_LOSS_COEF} (must be numeric)"
     exit 1
 fi
-echo "OPD_KL_MODE=${OPD_KL_MODE}, OPD_TOPK=${OPD_TOPK}, OPD_EXPLICIT_LOSS_COEF=${OPD_EXPLICIT_LOSS_COEF}"
+if ! [[ "${OPD_DISTILL_MAX_RESPONSE_LEN}" =~ ^-?[0-9]+$ ]] || { [[ "${OPD_DISTILL_MAX_RESPONSE_LEN}" -ne -1 ]] && [[ "${OPD_DISTILL_MAX_RESPONSE_LEN}" -le 0 ]]; }; then
+    echo "Invalid --opd-distill-max-response-len: ${OPD_DISTILL_MAX_RESPONSE_LEN} (must be -1 or positive integer)"
+    exit 1
+fi
+echo "OPD_KL_MODE=${OPD_KL_MODE}, OPD_TOPK=${OPD_TOPK}, OPD_EXPLICIT_LOSS_COEF=${OPD_EXPLICIT_LOSS_COEF}, OPD_DISTILL_MAX_RESPONSE_LEN=${OPD_DISTILL_MAX_RESPONSE_LEN}"
 
 set -ex
 export NCCL_P2P_DISABLE=1
@@ -189,7 +198,7 @@ ROLLOUT_ARGS=(
    --num-rollout 300
    --rollout-batch-size 128
    --n-samples-per-prompt 1
-   --rollout-max-response-len 8192
+   --rollout-max-response-len 4096
    --rollout-temperature 1.0
    --over-sampling-batch-size 128
 
@@ -206,9 +215,10 @@ RM_ARGS=(
 )
 
 EVAL_ARGS=(
-    --eval-interval 20
+    --eval-interval 10
     --eval-config examples/on_policy_distillation/eval_config.yaml
     --log-passrate
+    # --skip-eval-before-train
 )
 
 PERF_ARGS=(
@@ -235,6 +245,7 @@ GRPO_ARGS=(
    --opd-kl-mode "${OPD_KL_MODE}"
    --opd-topk "${OPD_TOPK}"
    --opd-explicit-loss-coef "${OPD_EXPLICIT_LOSS_COEF}"
+   --opd-distill-max-response-len "${OPD_DISTILL_MAX_RESPONSE_LEN}"
    --opd-zero-task-reward
    --opd-teacher-info-mode answer_only
    --opd-teacher-tokenizer "${TEACHER_MODEL_PATH}"
@@ -254,7 +265,7 @@ OPTIMIZER_ARGS=(
 WANDB_ARGS=(
    --use-wandb
    --wandb-project slime-dev
-   --wandb-group qwen3-1.7B-grpo_kl
+   --wandb-group qwen3-1.7B-8b-opd-answeronly-dapo
    --wandb-key 2ed6f8544ac3e30d5c08879166cc10d9c6232448
 )
 
@@ -278,7 +289,7 @@ echo "Starting Ray job..."
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 unset RAY_ADDRESS
 ray stop --force || true
-export CUDA_VISIBLE_DEVICES=3,5,7
+export CUDA_VISIBLE_DEVICES=5,7,8
 ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 3 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
 
 set +e
@@ -288,7 +299,7 @@ ray job submit --address="http://127.0.0.1:8265" \
      "env_vars": {
         "PYTHONPATH": "/root/Megatron-LM/",
         "CUDA_DEVICE_MAX_CONNECTIONS": "1",
-        "CUDA_VISIBLE_DEVICES": "3,5,7"
+        "CUDA_VISIBLE_DEVICES": "5,7,8"
      }
    }' \
    -- python3 train.py \
@@ -317,8 +328,8 @@ if [ "${TEACHER_STARTED_BY_SCRIPT}" -eq 1 ]; then
     pkill -9 sglang || true
 fi
 ray stop --force
-pkill -9 ray
-pkill -9 python
-sleep 3
-pkill -9 ray
-pkill -9 python
+# pkill -9 ray
+# pkill -9 python
+# sleep 3
+# pkill -9 ray
+# pkill -9 python

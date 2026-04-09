@@ -579,6 +579,10 @@ class RolloutManager:
 
         if samples[0].teacher_log_probs is not None:
             train_data["teacher_log_probs"] = [sample.teacher_log_probs for sample in samples]
+        if getattr(samples[0], "teacher_logprob_mask", None) is not None:
+            train_data["teacher_logprob_mask"] = [sample.teacher_logprob_mask for sample in samples]
+        if getattr(samples[0], "opd_distill_sample_mask", None) is not None:
+            train_data["opd_distill_sample_mask"] = [sample.opd_distill_sample_mask for sample in samples]
         if getattr(samples[0], "opd_topk_token_ids", None) is not None:
             train_data["opd_topk_token_ids"] = [sample.opd_topk_token_ids for sample in samples]
         if getattr(samples[0], "opd_topk_student_log_probs", None) is not None:
@@ -631,6 +635,8 @@ class RolloutManager:
                 "rollout_routed_experts",
                 "prompt",
                 "teacher_log_probs",
+                "teacher_logprob_mask",
+                "opd_distill_sample_mask",
                 "opd_topk_token_ids",
                 "opd_topk_student_log_probs",
                 "opd_topk_teacher_log_probs",

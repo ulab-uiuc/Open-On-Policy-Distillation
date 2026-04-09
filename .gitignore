@@ -12,6 +12,8 @@ data/
 
 student_teacher_plots_stu1.7b_teacher8b_answeronly/
 opsd*/
+output*/
+student*/
 output/
 # Distribution / packaging
 .Python

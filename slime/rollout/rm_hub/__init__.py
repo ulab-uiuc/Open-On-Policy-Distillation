@@ -27,8 +27,8 @@ async def remote_rm(args, sample: Sample):
             return await resp.json()
 
 
-async def async_rm(args, sample: Sample, **kwargs):
-    if args.custom_rm_path is not None:
+async def async_rm(args, sample: Sample, use_custom_rm: bool = True, **kwargs):
+    if use_custom_rm and args.custom_rm_path is not None:
         rm_function = load_function(args.custom_rm_path)
         return await rm_function(args, sample, **kwargs)
 
@@ -77,12 +77,13 @@ async def async_rm(args, sample: Sample, **kwargs):
 async def batched_async_rm(
     args,
     samples: list[Sample],
+    use_custom_rm: bool = True,
     **kwargs,
 ) -> list[int | float]:
-    if args.custom_rm_path is not None:
+    if use_custom_rm and args.custom_rm_path is not None:
         # Ensure the custom reward function is implemented in batch mode
         rm_function = load_function(args.custom_rm_path)
         return await rm_function(args, samples, **kwargs)
-    tasks = [async_rm(args, sample, **kwargs) for sample in samples]
+    tasks = [async_rm(args, sample, use_custom_rm=use_custom_rm, **kwargs) for sample in samples]
     rewards = await asyncio.gather(*tasks)
     return rewards

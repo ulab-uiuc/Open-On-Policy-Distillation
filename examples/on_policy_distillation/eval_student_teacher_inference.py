@@ -6,6 +6,94 @@ OpenAI-compatible chat completions API.
 
 
 '''
+
+  使用示例                                                                                                          
+                                                                                                                    
+  # 同时计算三种teacher：answer_only（特权信息）、same_as_student（无特权）、self-teacher（同一模型）
+  python examples/on_policy_distillation/eval_student_teacher_inference.py \
+    --model /root/checkpoints_siqi/Qwen3-1.7B \
+    --student-api-base http://127.0.0.1:30002/v1 \
+    --teacher-model Qwen/Qwen3-8B Qwen/Qwen3-8B /root/checkpoints_siqi/Qwen3-1.7B \
+    --teacher-api-base http://127.0.0.1:30001/v1 http://127.0.0.1:30001/v1 http://127.0.0.1:30002/v1 \
+    --teacher-info-mode answer_only same_as_student answer_only \
+    --dataset /root/math/data/train_dapo.jsonl \
+    --output ./eval_multi_teacher.jsonl \
+    --max-new-tokens 32768 \
+    --n-samples 16 \
+    --concurrency 256 \
+    --seed 42 \
+    --score-concurrency 1 \
+    --score-chunk-tokens 256 \
+    --student-enable-thinking true \
+    --output ./eval_dapo_student_teacher_inference_all_thinking_b16.jsonl
+                                                                                                                      
+  --teacher-api-base 和 --teacher-model 数量可以少于 --teacher-info-mode，不足的自动用最后一个值补齐。
+
+
+
+python examples/on_policy_distillation/eval_student_teacher_inference.py \
+    --model /root/checkpoints_siqi/Qwen3-1.7B \
+    --student-api-base http://0.0.0.0:30002/v1 \
+    --teacher-model Qwen/Qwen3-8B Qwen/Qwen3-8B Qwen/Qwen3-8B Qwen/Qwen3-1.7B /root/checkpoints_siqi/Qwen3-1.7B \
+    --teacher-api-base http://0.0.0.0:30001/v1 http://0.0.0.0:30001/v1 http://0.0.0.0:30001/v1 http://0.0.0.0:30002/v1 http://0.0.0.0:30002/v1 \
+    --teacher-info-mode full answer_only same_as_student full answer_only \
+    --dataset ./train_openthoughts_math.jsonl \
+    --max-new-tokens 16384 \
+    --n-samples 256 \
+    --concurrency 16 \
+    --seed 42 \
+    --score-concurrency 1 \
+    --score-chunk-tokens 256 \
+    --student-enable-thinking false \
+    --output ./eval_openthoughts_student_teacher_inference_all_nothinking_b256.jsonl
+
+
+
+    
+python examples/on_policy_distillation/eval_student_teacher_inference.py \
+    --model Qwen/Qwen3-8B \
+    --student-api-base http://0.0.0.0:30001/v1 \
+    --teacher-model Qwen/Qwen3-8B Qwen/Qwen3-8B \
+    --teacher-api-base http://0.0.0.0:30001/v1 http://0.0.0.0:30001/v1 \
+    --teacher-info-mode full answer_only \
+    --dataset ./train_openthoughts_math.jsonl \
+    --max-new-tokens 16384 \
+    --n-samples 128 \
+    --concurrency 16 \
+    --seed 42 \
+    --score-concurrency 4 \
+    --score-chunk-tokens 256 \
+    --student-enable-thinking false \
+    --output ./eval_openthoughts_student8b_teacher8b_inference_all_nothinking_entropy_b128.jsonl \
+    --record-student-token-entropy true \
+    --student-token-entropy-mode strict_exact \
+    --debug-print-first-student-meta-info false \
+    --student-token-entropy-topk 50
+
+
+
+python examples/on_policy_distillation/eval_student_teacher_inference.py \
+    --model Qwen/Qwen3-1.7B \
+    --student-api-base http://0.0.0.0:30002/v1 \
+    --teacher-model Qwen/Qwen3-8B Qwen/Qwen3-8B \
+    --teacher-api-base http://0.0.0.0:30001/v1 \
+    --teacher-info-mode full \
+    --dataset ./train_openthoughts_math.jsonl \
+    --max-new-tokens 16384 \
+    --n-samples 128 \
+    --concurrency 16 \
+    --seed 42 \
+    --score-concurrency 4 \
+    --score-chunk-tokens 256 \
+    --student-enable-thinking false \
+    --output ./eval_openthoughts_student1.7b_teacher8b_inference_all_nothinking_entropy_b128.jsonl \
+    --record-student-token-entropy true \
+    --student-token-entropy-mode auto \
+    --debug-print-first-student-meta-info false \
+    --student-token-entropy-topk 50
+
+    
+
 python examples/on_policy_distillation/eval_student_teacher_inference.py \
   --model /root/checkpoints_siqi/Qwen3-1.7B \
   --teacher-model /root/checkpoints_siqi/Qwen3-1.7B \
@@ -198,6 +286,7 @@ _DEFAULT_CONCISENESS_INSTRUCTION = (
     "Be direct -- avoid unnecessary elaboration, redundant steps, or restating the problem. "
     "Focus only on the key reasoning steps needed to reach the answer."
 )
+_META_INFO_PRINTED = False
 
 
 def _first_nonempty(*values):
@@ -377,19 +466,39 @@ def build_teacher_prefill_content(
     return f"<think>{think_content}\n</think>\n"
 
 
-def build_teacher_messages(row: dict, args, teacher_tokenizer) -> list[dict] | None:
+def build_teacher_messages(row: dict, mode: str, args, teacher_tokenizer) -> list[dict] | None:
     metadata = row.get("metadata", {}) or {}
     label = row.get("label", "") or ""
-    if args.teacher_info_mode == "none":
+    if mode == "none":
         return None
-    if args.teacher_info_mode == "same_as_student":
+    if mode == "same_as_student":
         return build_student_messages(row)
-    if args.teacher_info_mode in {"hidden_think", "hidden_think_full"}:
+
+    # For modes that use reference_solution as privileged information (full,
+    # masked_reasoning, hidden_think_full), fall back to the top-level
+    # ``ground_truth_solution`` field present in raw OpenThoughts-114k rows
+    # (i.e. train_openthoughts_math.jsonl) when the pre-processed
+    # metadata.reference_solution / metadata.solution are absent.
+    if mode in {"full", "masked_reasoning", "hidden_think", "hidden_think_full"}:
+        if not _first_nonempty(
+            metadata.get("reference_solution"),
+            metadata.get("solution"),
+        ):
+            raw_gts = _first_nonempty(
+                row.get("ground_truth_solution"),
+                row.get("deepseek_solution"),
+            )
+            if raw_gts:
+                # Shallow-copy to avoid mutating the original row
+                metadata = dict(metadata)
+                metadata["reference_solution"] = raw_gts
+
+    if mode in {"hidden_think", "hidden_think_full"}:
         student_user_content = metadata.get("student_user_content") or metadata.get("raw_content", "")
         prefill = build_teacher_prefill_content(
             metadata,
             label,
-            args.teacher_info_mode,
+            mode,
             teacher_tokenizer,
             args.teacher_think_max_tokens,
         )
@@ -400,10 +509,10 @@ def build_teacher_messages(row: dict, args, teacher_tokenizer) -> list[dict] | N
             {"role": "assistant", "content": prefill},
         ]
 
-    teacher_user_content = build_teacher_user_content(metadata, label, args.teacher_info_mode, args)
+    teacher_user_content = build_teacher_user_content(metadata, label, mode, args)
     return [{"role": "user", "content": teacher_user_content}] if teacher_user_content is not None else None
 
-
+""
 def build_client(base_url: str, api_key: str) -> AsyncOpenAI:
     return AsyncOpenAI(api_key=api_key, base_url=base_url)
 
@@ -577,6 +686,383 @@ def _extract_scalar_logprob(item: Any) -> float:
     return _to_float_or_nan(item)
 
 
+def _maybe_debug_print_first_student_meta_info(meta_info: dict[str, Any], enabled: bool) -> None:
+    if not enabled:
+        return
+    global _META_INFO_PRINTED
+    if _META_INFO_PRINTED:
+        return
+    _META_INFO_PRINTED = True
+    try:
+        keys = sorted(meta_info.keys()) if isinstance(meta_info, dict) else []
+        logger.info("[DEBUG] First student meta_info keys: %s", keys)
+        pretty = json.dumps(meta_info, ensure_ascii=False, indent=2)
+        logger.info("[DEBUG] First student meta_info (truncated to 12000 chars):\n%s", pretty[:12000])
+        otlp = meta_info.get("output_token_logprobs")
+        if isinstance(otlp, list) and otlp:
+            first_item = json.dumps(otlp[0], ensure_ascii=False, indent=2)
+            logger.info(
+                "[DEBUG] First output_token_logprobs entry (truncated to 4000 chars):\n%s",
+                first_item[:4000],
+            )
+        # Helpful for servers that return top-k in sidecar fields rather than
+        # the 3rd entry of output_token_logprobs.
+        for key in ("output_top_logprobs", "output_token_top_logprobs"):
+            side = meta_info.get(key)
+            if isinstance(side, list):
+                l0 = len(side)
+                l1 = len(side[0]) if l0 > 0 and isinstance(side[0], (list, tuple)) else None
+                l2 = (
+                    len(side[0][0])
+                    if l0 > 0
+                    and isinstance(side[0], (list, tuple))
+                    and len(side[0]) > 0
+                    and isinstance(side[0][0], (list, tuple, dict))
+                    and not isinstance(side[0][0], dict)
+                    else None
+                )
+                logger.info("[DEBUG] %s lens: outer=%s first=%s first_first=%s", key, l0, l1, l2)
+                logger.info(
+                    "[DEBUG] %s first entry (truncated to 4000 chars):\n%s",
+                    key,
+                    json.dumps(side[0], ensure_ascii=False, indent=2)[:4000] if l0 > 0 else "[]",
+                )
+    except Exception as e:
+        logger.warning("Failed to print debug student meta_info: %s", e)
+
+
+def _extract_output_token_entropies_from_meta_info(meta_info: dict[str, Any]) -> list[float] | None:
+    if not isinstance(meta_info, dict):
+        return None
+    for key in (
+        "output_token_entropy",
+        "output_token_entropies",
+        "output_token_entropy_val",
+        "output_token_entropy_vals",
+        "output_token_entropy_values",
+        "token_entropies",
+        "token_entropy_vals",
+        "token_entropy_values",
+    ):
+        raw = meta_info.get(key)
+        if raw is None:
+            continue
+        if not isinstance(raw, (list, tuple)):
+            raise ValueError(f"`meta_info.{key}` must be a list/tuple, got {type(raw)}.")
+        return [_to_float_or_nan(x) for x in raw]
+    return None
+
+
+def _extract_output_token_entropies_from_output_items(output_token_logprobs: list[Any]) -> list[float] | None:
+    if not isinstance(output_token_logprobs, (list, tuple)) or not output_token_logprobs:
+        return None
+    values: list[float] = []
+    found_any = False
+    for item in output_token_logprobs:
+        entropy_val = None
+        if isinstance(item, dict):
+            for key in (
+                "entropy",
+                "entropy_val",
+                "token_entropy",
+                "token_entropy_val",
+                "output_token_entropy",
+                "output_token_entropy_val",
+            ):
+                if key in item:
+                    entropy_val = item.get(key)
+                    break
+        elif isinstance(item, (list, tuple)):
+            # Common tuple shape: [logprob, token_id, top_logprobs, entropy, ...]
+            if len(item) >= 4:
+                entropy_val = item[3]
+            if entropy_val is None:
+                for obj in item[2:]:
+                    if not isinstance(obj, dict):
+                        continue
+                    for key in (
+                        "entropy",
+                        "entropy_val",
+                        "token_entropy",
+                        "token_entropy_val",
+                        "output_token_entropy",
+                        "output_token_entropy_val",
+                    ):
+                        if key in obj:
+                            entropy_val = obj.get(key)
+                            break
+                    if entropy_val is not None:
+                        break
+        if entropy_val is None:
+            return None
+        found_any = True
+        values.append(_to_float_or_nan(entropy_val))
+    return values if found_any else None
+
+
+def _extract_id_logprob_map(raw: Any) -> dict[int, float]:
+    mapping: dict[int, float] = {}
+    if raw is None:
+        return mapping
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            try:
+                tid = int(k)
+            except Exception:
+                continue
+            try:
+                mapping[tid] = _extract_scalar_logprob(v)
+            except Exception:
+                continue
+        return mapping
+    if isinstance(raw, (list, tuple)):
+        for item in raw:
+            if isinstance(item, dict):
+                token_id = item.get("token_id", item.get("id", item.get("token")))
+                if token_id is None:
+                    continue
+                try:
+                    mapping[int(token_id)] = _extract_scalar_logprob(item)
+                except Exception:
+                    continue
+            elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                a, b = item[0], item[1]
+                try:
+                    tid = int(b)
+                    lp = _extract_scalar_logprob(a)
+                except Exception:
+                    try:
+                        tid = int(a)
+                        lp = _extract_scalar_logprob(b)
+                    except Exception:
+                        continue
+                mapping[tid] = lp
+    return mapping
+
+
+def _extract_top_logprob_values(raw: Any) -> list[float]:
+    values: list[float] = []
+    if raw is None:
+        return values
+    if isinstance(raw, dict):
+        for _, v in raw.items():
+            try:
+                values.append(_extract_scalar_logprob(v))
+            except Exception:
+                continue
+        return values
+    if isinstance(raw, (list, tuple)):
+        for item in raw:
+            if isinstance(item, dict):
+                # Common dict forms:
+                # {"token_id": 10, "logprob": -1.2}, {"token": "A", "logprob": -1.2}, {"id": 10, "value": -1.2}
+                if "logprob" in item or "value" in item:
+                    try:
+                        values.append(_extract_scalar_logprob(item))
+                        continue
+                    except Exception:
+                        pass
+                # Fallback: pick the first numeric-like field.
+                picked = False
+                for _, v in item.items():
+                    try:
+                        values.append(_extract_scalar_logprob(v))
+                        picked = True
+                        break
+                    except Exception:
+                        continue
+                if picked:
+                    continue
+            elif isinstance(item, (list, tuple)):
+                # Common tuple forms: [logprob, token_id, ...] or [token_id, logprob, ...]
+                if len(item) >= 2:
+                    try:
+                        values.append(_extract_scalar_logprob(item[0]))
+                        continue
+                    except Exception:
+                        pass
+                    try:
+                        values.append(_extract_scalar_logprob(item[1]))
+                        continue
+                    except Exception:
+                        continue
+            else:
+                try:
+                    values.append(_extract_scalar_logprob(item))
+                except Exception:
+                    continue
+    return values
+
+
+def _entropy_from_top_logprobs(logprob_map: dict[int, float]) -> float:
+    if not logprob_map:
+        raise ValueError("Missing top-logprob map for entropy approximation.")
+    probs = [math.exp(lp) for lp in logprob_map.values() if math.isfinite(lp)]
+    if not probs:
+        return float("nan")
+    sum_top = float(sum(probs))
+    if sum_top > 1.0:
+        probs = [p / sum_top for p in probs]
+        sum_top = 1.0
+    tail = max(0.0, 1.0 - sum_top)
+    entropy = 0.0
+    for p in probs:
+        if p > 0.0:
+            entropy -= p * math.log(p)
+    if tail > 0.0:
+        entropy -= tail * math.log(tail)
+    return entropy
+
+
+def _entropy_from_top_logprob_values(logprobs: list[float]) -> float:
+    finite_logps = [lp for lp in logprobs if math.isfinite(lp)]
+    if not finite_logps:
+        return float("nan")
+    probs = [math.exp(lp) for lp in finite_logps]
+    sum_top = float(sum(probs))
+    if sum_top > 1.0:
+        probs = [p / sum_top for p in probs]
+        sum_top = 1.0
+    tail = max(0.0, 1.0 - sum_top)
+    entropy = 0.0
+    for p in probs:
+        if p > 0.0:
+            entropy -= p * math.log(p)
+    if tail > 0.0:
+        entropy -= tail * math.log(tail)
+    return entropy
+
+
+def _probs_mass_from_logprobs(logprobs: list[float]) -> float:
+    finite_logps = [lp for lp in logprobs if math.isfinite(lp)]
+    if not finite_logps:
+        return float("nan")
+    return float(sum(math.exp(lp) for lp in finite_logps))
+
+
+def _extract_output_token_entropies_from_top_logprobs_with_mass(
+    output_token_logprobs: list[Any],
+    top_logprobs_sidecar: list[Any] | None = None,
+) -> tuple[list[float], list[float]]:
+    entropies: list[float] = []
+    masses: list[float] = []
+    for idx, item in enumerate(output_token_logprobs):
+        top_source = None
+        if (
+            isinstance(top_logprobs_sidecar, list)
+            and idx < len(top_logprobs_sidecar)
+            and top_logprobs_sidecar[idx] is not None
+        ):
+            top_source = top_logprobs_sidecar[idx]
+        elif isinstance(item, (list, tuple)) and len(item) >= 3:
+            top_source = item[2]
+        if not isinstance(item, (list, tuple)) or len(item) < 3:
+            if top_source is None:
+                raise ValueError(
+                    "Top-k entropy mode requires top_logprobs in each `output_token_logprobs` entry; "
+                    f"entry[{idx}] is invalid."
+                )
+        top_logprob_values = _extract_top_logprob_values(top_source)
+        if not top_logprob_values:
+            top_logprob_map = _extract_id_logprob_map(top_source)
+            if top_logprob_map:
+                vals = list(top_logprob_map.values())
+                masses.append(_probs_mass_from_logprobs(vals))
+                entropies.append(_entropy_from_top_logprob_values(vals))
+                continue
+            raise ValueError(
+                "Top-k entropy mode requires non-empty top_logprobs; "
+                f"entry[{idx}] has no parseable top-logprob pairs."
+            )
+        masses.append(_probs_mass_from_logprobs(top_logprob_values))
+        entropies.append(_entropy_from_top_logprob_values(top_logprob_values))
+    return entropies, masses
+
+
+def _extract_output_token_entropies_from_top_logprobs(
+    output_token_logprobs: list[Any],
+    top_logprobs_sidecar: list[Any] | None = None,
+) -> list[float]:
+    entropies, _ = _extract_output_token_entropies_from_top_logprobs_with_mass(
+        output_token_logprobs=output_token_logprobs,
+        top_logprobs_sidecar=top_logprobs_sidecar,
+    )
+    return entropies
+
+
+def extract_student_output_token_entropies(
+    *,
+    meta_info: dict[str, Any],
+    output_token_logprobs: list[Any],
+    mode: str,
+) -> list[float]:
+    if mode not in {"auto", "strict_exact", "topk_approx"}:
+        raise ValueError(f"Unsupported student-token-entropy mode: {mode!r}")
+    exact = _extract_output_token_entropies_from_meta_info(meta_info)
+    if exact is None:
+        exact = _extract_output_token_entropies_from_output_items(output_token_logprobs)
+    if mode == "strict_exact":
+        top_logprobs_sidecar = (
+            meta_info.get("output_top_logprobs")
+            or meta_info.get("output_token_top_logprobs")
+            or meta_info.get("top_logprobs")
+        )
+        if exact is None:
+            try:
+                sidecar_entropies, masses = _extract_output_token_entropies_from_top_logprobs_with_mass(
+                    output_token_logprobs=output_token_logprobs,
+                    top_logprobs_sidecar=top_logprobs_sidecar,
+                )
+                # strict_exact accepts top-logprobs only when it is effectively full-vocab
+                # (probability mass per position is very close to 1).
+                mass_eps = 5e-3
+                if masses and all(math.isfinite(m) and m >= (1.0 - mass_eps) for m in masses):
+                    exact = sidecar_entropies
+            except Exception:
+                pass
+        if exact is None:
+            meta_keys = sorted(meta_info.keys()) if isinstance(meta_info, dict) else []
+            has_sidecar_topk = bool(
+                isinstance(meta_info, dict)
+                and (
+                    meta_info.get("output_top_logprobs") is not None
+                    or meta_info.get("output_token_top_logprobs") is not None
+                    or meta_info.get("top_logprobs") is not None
+                )
+            )
+            has_embedded_topk = any(
+                isinstance(item, (list, tuple)) and len(item) >= 3 and item[2] is not None for item in output_token_logprobs
+            )
+            sidecar_hint = (
+                " Found top-k logprobs, but top-k cannot provide strict exact entropy unless probability mass is near 1.0."
+                if (has_sidecar_topk or has_embedded_topk)
+                else ""
+            )
+            raise ValueError(
+                "student-token-entropy mode is strict_exact, but no exact entropy field was found in meta_info. "
+                "Expected one of: output_token_entropy, output_token_entropies, output_token_entropy_val, "
+                "or per-token exact entropy embedded in output_token_logprobs items."
+                f" meta_info_keys={meta_keys}.{sidecar_hint} "
+                "Use --student-token-entropy-mode auto/topk_approx, or enable exact entropy on the serving backend."
+            )
+        return exact
+    if mode == "topk_approx":
+        top_logprobs_sidecar = (
+            meta_info.get("output_top_logprobs")
+            or meta_info.get("output_token_top_logprobs")
+            or meta_info.get("top_logprobs")
+        )
+        return _extract_output_token_entropies_from_top_logprobs(output_token_logprobs, top_logprobs_sidecar)
+    if exact is not None:
+        return exact
+    top_logprobs_sidecar = (
+        meta_info.get("output_top_logprobs")
+        or meta_info.get("output_token_top_logprobs")
+        or meta_info.get("top_logprobs")
+    )
+    return _extract_output_token_entropies_from_top_logprobs(output_token_logprobs, top_logprobs_sidecar)
+
+
 def _slice_response_logprobs(
     input_token_logprobs: list[Any],
     full_input_len: int,
@@ -725,7 +1211,11 @@ async def _generate_one_with_logprobs(
     adaptive_oom_retry: bool,
     oom_min_max_new_tokens: int,
     oom_cooldown_seconds: float,
-) -> tuple[str, list[int], list[float]]:
+    record_student_token_entropy: bool,
+    student_token_entropy_mode: str,
+    student_token_entropy_topk: int,
+    debug_print_first_student_meta_info: bool = False,
+) -> tuple[str, list[int], list[float], list[float] | None]:
     max_new_tokens = max(1, int(sampling_params["max_tokens"]))
     min_new_tokens = max(1, int(oom_min_max_new_tokens))
 
@@ -743,14 +1233,30 @@ async def _generate_one_with_logprobs(
                 },
                 "return_logprob": True,
             }
+            if record_student_token_entropy:
+                payload["top_logprobs_num"] = int(student_token_entropy_topk)
             output = await _post_json_checked(session, generate_url, payload)
             text = output.get("text", "") or ""
-            output_token_logprobs = output.get("meta_info", {}).get("output_token_logprobs")
+            meta_info = output.get("meta_info", {}) or {}
+            _maybe_debug_print_first_student_meta_info(meta_info, debug_print_first_student_meta_info)
+            output_token_logprobs = meta_info.get("output_token_logprobs")
             if output_token_logprobs is None:
                 raise KeyError("`meta_info.output_token_logprobs` not found in generation response.")
             token_ids = [int(item[1]) for item in output_token_logprobs]
             token_logprobs = [_extract_scalar_logprob(item) for item in output_token_logprobs]
-            return text, token_ids, token_logprobs
+            token_entropies = None
+            if record_student_token_entropy:
+                token_entropies = extract_student_output_token_entropies(
+                    meta_info=meta_info,
+                    output_token_logprobs=output_token_logprobs,
+                    mode=student_token_entropy_mode,
+                )
+                if len(token_entropies) != len(token_ids):
+                    raise ValueError(
+                        "Student token entropy length mismatch: "
+                        f"entropies={len(token_entropies)} token_ids={len(token_ids)}."
+                    )
+            return text, token_ids, token_logprobs, token_entropies
         except Exception as e:
             last_error = e
             if adaptive_oom_retry and _is_probable_oom_error(e) and max_new_tokens > min_new_tokens:
@@ -814,12 +1320,17 @@ async def _async_batch_generate_with_logprobs(
     adaptive_oom_retry: bool,
     oom_min_max_new_tokens: int,
     oom_cooldown_seconds: float,
-) -> tuple[list[str], list[list[int]], list[list[float]]]:
+    record_student_token_entropy: bool,
+    student_token_entropy_mode: str,
+    student_token_entropy_topk: int,
+    debug_print_first_student_meta_info: bool,
+) -> tuple[list[str], list[list[int]], list[list[float]], list[list[float] | None]]:
     from tqdm import tqdm
 
     texts: list[str | None] = [None] * len(requests)
     token_ids_list: list[list[int] | None] = [None] * len(requests)
     token_logprobs_list: list[list[float] | None] = [None] * len(requests)
+    token_entropy_list: list[list[float] | None] = [None] * len(requests)
     semaphore = asyncio.Semaphore(max(1, concurrency))
     timeout = aiohttp.ClientTimeout(total=None, connect=120, sock_connect=120, sock_read=1800)
 
@@ -827,7 +1338,7 @@ async def _async_batch_generate_with_logprobs(
 
         async def _run(result_idx: int, input_ids: list[int]):
             async with semaphore:
-                text, token_ids, token_logprobs = await _generate_one_with_logprobs(
+                text, token_ids, token_logprobs, token_entropies = await _generate_one_with_logprobs(
                     session=session,
                     generate_url=generate_url,
                     input_ids=input_ids,
@@ -837,8 +1348,12 @@ async def _async_batch_generate_with_logprobs(
                     adaptive_oom_retry=adaptive_oom_retry,
                     oom_min_max_new_tokens=oom_min_max_new_tokens,
                     oom_cooldown_seconds=oom_cooldown_seconds,
+                    record_student_token_entropy=record_student_token_entropy,
+                    student_token_entropy_mode=student_token_entropy_mode,
+                    student_token_entropy_topk=student_token_entropy_topk,
+                    debug_print_first_student_meta_info=(debug_print_first_student_meta_info and result_idx == 0),
                 )
-                return result_idx, text, token_ids, token_logprobs
+                return result_idx, text, token_ids, token_logprobs, token_entropies
 
         tasks = [
             asyncio.create_task(_run(result_idx, input_ids))
@@ -846,16 +1361,18 @@ async def _async_batch_generate_with_logprobs(
         ]
         with tqdm(total=len(tasks), desc=progress_desc) as pbar:
             for task in asyncio.as_completed(tasks):
-                result_idx, text, token_ids, token_logprobs = await task
+                result_idx, text, token_ids, token_logprobs, token_entropies = await task
                 texts[result_idx] = text
                 token_ids_list[result_idx] = token_ids
                 token_logprobs_list[result_idx] = token_logprobs
+                token_entropy_list[result_idx] = token_entropies
                 pbar.update(1)
 
     return (
         [x if x is not None else "" for x in texts],
         [x if x is not None else [] for x in token_ids_list],
         [x if x is not None else [] for x in token_logprobs_list],
+        token_entropy_list,
     )
 
 
@@ -870,7 +1387,11 @@ def batch_generate_with_logprobs(
     adaptive_oom_retry: bool,
     oom_min_max_new_tokens: int,
     oom_cooldown_seconds: float,
-) -> tuple[list[str], list[list[int]], list[list[float]]]:
+    record_student_token_entropy: bool,
+    student_token_entropy_mode: str,
+    student_token_entropy_topk: int,
+    debug_print_first_student_meta_info: bool,
+) -> tuple[list[str], list[list[int]], list[list[float]], list[list[float] | None]]:
     return asyncio.run(
         _async_batch_generate_with_logprobs(
             requests=requests,
@@ -883,6 +1404,10 @@ def batch_generate_with_logprobs(
             adaptive_oom_retry=adaptive_oom_retry,
             oom_min_max_new_tokens=oom_min_max_new_tokens,
             oom_cooldown_seconds=oom_cooldown_seconds,
+            record_student_token_entropy=record_student_token_entropy,
+            student_token_entropy_mode=student_token_entropy_mode,
+            student_token_entropy_topk=student_token_entropy_topk,
+            debug_print_first_student_meta_info=debug_print_first_student_meta_info,
         )
     )
 
@@ -1030,6 +1555,149 @@ def batch_score(
     )
 
 
+def _merge_chunked_teacher_scores(
+    chunked_logprobs_by_idx: dict[int, list[tuple[int, list[float]]]],
+    score_expected_len: dict[int, int],
+) -> dict[int, list[float]]:
+    """Merge chunked teacher score results back into per-sample logprob lists."""
+    result: dict[int, list[float]] = {}
+    for sample_idx, pieces in chunked_logprobs_by_idx.items():
+        pieces.sort(key=lambda x: x[0])
+        merged: list[float] = []
+        cursor = 0
+        for offset, chunk_vals in pieces:
+            values = list(chunk_vals)
+            if offset > cursor:
+                gap = offset - cursor
+                logger.warning(
+                    "Teacher score chunk gap for sample %d: offset=%d cursor=%d (filling %d NaNs).",
+                    sample_idx, offset, cursor, gap,
+                )
+                merged.extend([float("nan")] * gap)
+                cursor = offset
+            elif offset < cursor:
+                overlap = cursor - offset
+                if overlap >= len(values):
+                    logger.warning(
+                        "Teacher score chunk overlap fully skipped for sample %d: "
+                        "offset=%d cursor=%d chunk_len=%d.",
+                        sample_idx, offset, cursor, len(values),
+                    )
+                    continue
+                logger.warning(
+                    "Teacher score chunk overlap for sample %d: offset=%d cursor=%d (dropping %d tokens).",
+                    sample_idx, offset, cursor, overlap,
+                )
+                values = values[overlap:]
+            merged.extend(values)
+            cursor += len(values)
+
+        expected_len = score_expected_len.get(sample_idx)
+        if expected_len is not None and len(merged) != expected_len:
+            if len(merged) > expected_len:
+                logger.warning(
+                    "Teacher score length overflow for sample %d: expected=%d got=%d (truncating).",
+                    sample_idx, expected_len, len(merged),
+                )
+                merged = merged[:expected_len]
+            else:
+                logger.warning(
+                    "Teacher score length underflow for sample %d: expected=%d got=%d (padding NaNs).",
+                    sample_idx, expected_len, len(merged),
+                )
+                merged.extend([float("nan")] * (expected_len - len(merged)))
+        result[sample_idx] = merged
+    return result
+
+
+def _score_with_teacher_config(
+    student_responses: list[str],
+    rows: list[dict],
+    mode: str,
+    model: str,
+    api_base: str,
+    scoring_tokenizer,
+    prompt_tokenizer,
+    teacher_enable_thinking,
+    args,
+) -> dict[int, list[float]]:
+    """Build score requests for one teacher config and run batch_score. Returns logprob_by_idx."""
+    teacher_prompt_messages: list[list[dict] | None] = [None] * len(rows)
+    for sample_idx, row in enumerate(rows):
+        teacher_prompt_messages[sample_idx] = build_teacher_messages(row, mode, args, prompt_tokenizer)
+
+    teacher_score_requests: list[tuple[int, int, list[int], int, int]] = []
+    teacher_score_expected_len: dict[int, int] = {}
+
+    for sample_idx, s_resp in enumerate(student_responses):
+        t_messages = teacher_prompt_messages[sample_idx]
+        if t_messages is None or scoring_tokenizer is None:
+            continue
+        teacher_continue_final = t_messages[-1]["role"] == "assistant"
+        t_full_ids, t_start, t_resp_ids = build_forced_score_input_ids(
+            tokenizer=scoring_tokenizer,
+            prompt_messages=t_messages,
+            response_text=s_resp,
+            continue_final_message=teacher_continue_final,
+            enable_thinking=teacher_enable_thinking,
+        )
+        score_input_ids = t_full_ids
+        score_response_len = len(t_resp_ids)
+        if args.max_score_response_tokens is not None and score_response_len > args.max_score_response_tokens:
+            score_response_len = max(1, int(args.max_score_response_tokens))
+            score_input_ids = t_full_ids[: t_start + score_response_len]
+            logger.warning(
+                "Sample %d teacher[mode=%s] scoring truncated to first %d response tokens (from %d).",
+                sample_idx, mode, score_response_len, len(t_resp_ids),
+            )
+        teacher_score_expected_len[sample_idx] = score_response_len
+        teacher_score_requests.extend(
+            _build_score_requests_for_response(
+                sample_idx=sample_idx,
+                full_input_ids=score_input_ids,
+                response_start=t_start,
+                response_len=score_response_len,
+                chunk_tokens=args.score_chunk_tokens,
+                context_window_tokens=args.score_context_window_tokens,
+            )
+        )
+
+    if not teacher_score_requests:
+        teacher_prompt_none_count = sum(1 for m in teacher_prompt_messages if m is None)
+        if mode == "none":
+            logger.info("Teacher scoring disabled (mode='none'); teacher_logprobs will be null.")
+        else:
+            logger.warning(
+                "No teacher score requests were built (mode=%s, prompt_none=%d/%d). "
+                "teacher_logprobs will be null.",
+                mode, teacher_prompt_none_count, len(teacher_prompt_messages),
+            )
+        return {}
+
+    logger.info(
+        "Scoring student tokens with teacher[mode=%s] via /generate: base=%s model=%s score_temperature=%.4g",
+        mode, api_base, model, args.score_temperature,
+    )
+    teacher_scored = batch_score(
+        requests=teacher_score_requests,
+        generate_url=_to_generate_url(api_base),
+        concurrency=args.score_concurrency,
+        progress_desc=f"Teacher[{mode}] scoring",
+        retries=args.retries,
+        score_logprob_start=args.score_logprob_start,
+        score_temperature=args.score_temperature,
+        adaptive_oom_retry=not args.disable_adaptive_oom_retry,
+        oom_min_score_response_tokens=args.oom_min_score_response_tokens,
+        oom_cooldown_seconds=args.oom_cooldown_seconds,
+    )
+
+    chunked_logprobs_by_idx: dict[int, list[tuple[int, list[float]]]] = {}
+    for (sample_idx, response_offset, *_), scored in zip(teacher_score_requests, teacher_scored):
+        chunked_logprobs_by_idx.setdefault(sample_idx, []).append((response_offset, scored))
+
+    return _merge_chunked_teacher_scores(chunked_logprobs_by_idx, teacher_score_expected_len)
+
+
 def _load_tokenizer(source: str):
     from transformers import AutoTokenizer
 
@@ -1064,6 +1732,15 @@ def _parse_enable_thinking_arg(value: str) -> bool | None:
     if v == "false":
         return False
     raise ValueError(f"Unsupported enable_thinking value: {value!r}")
+
+
+def _parse_bool_arg(value: str) -> bool:
+    v = str(value).strip().lower()
+    if v == "true":
+        return True
+    if v == "false":
+        return False
+    raise ValueError(f"Unsupported boolean value: {value!r}, expected true/false.")
 
 
 def _format_enable_thinking(value: bool | None) -> str:
@@ -1112,31 +1789,39 @@ def _count_zero_logprobs(values: list[float], atol: float = 1e-12) -> tuple[int,
 
 def run_eval(args):
     samples = load_dataset(args.dataset, args.n_samples, args.seed)
-    teacher_prompt_tokenizer = maybe_load_tokenizer(args)
+
     student_scoring_tokenizer = _load_tokenizer(args.model)
-    teacher_model = args.teacher_model or args.model
-    teacher_scoring_tokenizer = _load_tokenizer(teacher_model) if args.teacher_info_mode != "none" else None
+
+    # Pre-load scoring and prompt tokenizers per teacher config, cached by model name.
+    scoring_tok_cache: dict[str, Any] = {}
+    prompt_tok_cache: dict[str, Any] = {}
+    for tc in args.teacher_configs:
+        if tc["mode"] == "none":
+            continue
+        model = tc["model"]
+        if model not in scoring_tok_cache:
+            scoring_tok_cache[model] = _load_tokenizer(model)
+        if tc["mode"] in {"hidden_think", "hidden_think_full", "masked_reasoning"} and model not in prompt_tok_cache:
+            from transformers import AutoTokenizer
+            logger.info("Loading prompt tokenizer from %s for mode=%s", model, tc["mode"])
+            prompt_tok_cache[model] = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
 
     student_requests = []
-    teacher_prompt_messages = [None] * len(samples)
     labels = []
     answer_formats = []
     metadata_list = []
+    rows = []
 
     for sample_idx, row in enumerate(samples):
         metadata = row.get("metadata", {}) or {}
         label = row.get("label", "") or ""
-
         student_messages = build_student_messages(row)
         student_continue_final = bool(student_messages) and student_messages[-1]["role"] == "assistant"
         student_requests.append((sample_idx, student_messages, student_continue_final))
-
-        teacher_messages = build_teacher_messages(row, args, teacher_prompt_tokenizer)
-        teacher_prompt_messages[sample_idx] = teacher_messages
-
         labels.append(label)
         answer_formats.append(_infer_answer_format(metadata))
         metadata_list.append(metadata)
+        rows.append(row)
 
     sampling_params = {
         "temperature": args.temperature,
@@ -1159,7 +1844,8 @@ def run_eval(args):
         args.student_api_base,
         args.model,
     )
-    student_responses, student_response_token_ids_raw, student_response_logprobs_raw = batch_generate_with_logprobs(
+    student_responses, student_response_token_ids_raw, student_response_logprobs_raw, student_response_entropies_raw = (
+        batch_generate_with_logprobs(
         requests=student_generation_requests,
         sampling_params=sampling_params,
         generate_url=_to_generate_url(args.student_api_base),
@@ -1170,6 +1856,11 @@ def run_eval(args):
         adaptive_oom_retry=not args.disable_adaptive_oom_retry,
         oom_min_max_new_tokens=args.oom_min_max_new_tokens,
         oom_cooldown_seconds=args.oom_cooldown_seconds,
+            record_student_token_entropy=args.record_student_token_entropy,
+            student_token_entropy_mode=args.student_token_entropy_mode,
+            student_token_entropy_topk=args.student_token_entropy_topk,
+            debug_print_first_student_meta_info=getattr(args, "debug_print_first_student_meta_info", False),
+        )
     )
     student_response_token_count_by_idx = {
         sample_idx: len(token_ids)
@@ -1181,150 +1872,52 @@ def run_eval(args):
         sample_idx: list(logprobs)
         for (sample_idx, _), logprobs in zip(student_generation_requests, student_response_logprobs_raw)
     }
+    student_entropy_by_idx = {
+        sample_idx: (list(entropies) if entropies is not None else None)
+        for (sample_idx, _), entropies in zip(student_generation_requests, student_response_entropies_raw)
+    }
 
-    teacher_score_requests = []
-    teacher_score_expected_len: dict[int, int] = {}
+    # Score student responses with each teacher config sequentially.
+    all_teacher_results: list[tuple[dict, dict[int, list[float]]]] = []
+    for tc in args.teacher_configs:
+        mode = tc["mode"]
+        model = tc["model"]
+        api_base = tc["api_base"]
 
-    for sample_idx, s_resp in enumerate(student_responses):
-        t_messages = teacher_prompt_messages[sample_idx]
-        if t_messages is None or teacher_scoring_tokenizer is None:
+        if mode == "none":
+            logger.info("Teacher config %d (mode=none): skipping scoring.", tc["index"])
+            all_teacher_results.append((tc, {}))
             continue
-        teacher_continue_final = t_messages[-1]["role"] == "assistant"
-        t_full_ids, t_start, t_resp_ids = build_forced_score_input_ids(
-            tokenizer=teacher_scoring_tokenizer,
-            prompt_messages=t_messages,
-            response_text=s_resp,
-            continue_final_message=teacher_continue_final,
-            enable_thinking=args.teacher_enable_thinking,
-        )
-        score_input_ids = t_full_ids
-        score_response_len = len(t_resp_ids)
-        if args.max_score_response_tokens is not None and score_response_len > args.max_score_response_tokens:
-            score_response_len = max(1, int(args.max_score_response_tokens))
-            score_input_ids = t_full_ids[: t_start + score_response_len]
+
+        scoring_tokenizer = scoring_tok_cache.get(model)
+        prompt_tokenizer = prompt_tok_cache.get(model)
+
+        # Determine teacher_enable_thinking for this config (hidden_think modes require False).
+        t_enable_thinking = args.teacher_enable_thinking
+        if t_enable_thinking and mode in {"hidden_think", "hidden_think_full"}:
             logger.warning(
-                "Sample %d teacher scoring truncated to first %d response tokens (from %d) to reduce memory.",
-                sample_idx,
-                score_response_len,
-                len(t_resp_ids),
+                "teacher_enable_thinking=true with %s may conflict with injected <think> prefill; "
+                "forcing teacher_enable_thinking=false for this config.",
+                mode,
             )
-        teacher_score_expected_len[sample_idx] = score_response_len
-        teacher_score_requests.extend(
-            _build_score_requests_for_response(
-                sample_idx=sample_idx,
-                full_input_ids=score_input_ids,
-                response_start=t_start,
-                response_len=score_response_len,
-                chunk_tokens=args.score_chunk_tokens,
-                context_window_tokens=args.score_context_window_tokens,
-            )
+            t_enable_thinking = False
+
+        logprob_by_idx = _score_with_teacher_config(
+            student_responses=student_responses,
+            rows=rows,
+            mode=mode,
+            model=model,
+            api_base=api_base,
+            scoring_tokenizer=scoring_tokenizer,
+            prompt_tokenizer=prompt_tokenizer,
+            teacher_enable_thinking=t_enable_thinking,
+            args=args,
         )
-
-    teacher_logprob_by_idx = {}
-    if not teacher_score_requests:
-        teacher_prompt_none_count = sum(1 for m in teacher_prompt_messages if m is None)
-        if args.teacher_info_mode == "none":
-            logger.info(
-                "Teacher scoring disabled because teacher_info_mode='none'; teacher_logprobs will be null."
-            )
-        else:
-            logger.warning(
-                "No teacher score requests were built (teacher_info_mode=%s, teacher_prompt_messages_none=%d/%d). "
-                "teacher_logprobs will be null.",
-                args.teacher_info_mode,
-                teacher_prompt_none_count,
-                len(teacher_prompt_messages),
-            )
-
-    if teacher_score_requests:
-        logger.info(
-            "Scoring student sampled tokens with teacher model via /generate: base=%s model=%s score_temperature=%.4g",
-            args.teacher_api_base,
-            teacher_model,
-            args.score_temperature,
-        )
-        teacher_scored = batch_score(
-            requests=teacher_score_requests,
-            generate_url=_to_generate_url(args.teacher_api_base),
-            concurrency=args.score_concurrency,
-            progress_desc="Teacher token scoring",
-            retries=args.retries,
-            score_logprob_start=args.score_logprob_start,
-            score_temperature=args.score_temperature,
-            adaptive_oom_retry=not args.disable_adaptive_oom_retry,
-            oom_min_score_response_tokens=args.oom_min_score_response_tokens,
-            oom_cooldown_seconds=args.oom_cooldown_seconds,
-        )
-        chunked_logprobs_by_idx: dict[int, list[tuple[int, list[float]]]] = {}
-        for (sample_idx, response_offset, *_), scored in zip(teacher_score_requests, teacher_scored):
-            chunked_logprobs_by_idx.setdefault(sample_idx, []).append((response_offset, scored))
-
-        for sample_idx, pieces in chunked_logprobs_by_idx.items():
-            pieces.sort(key=lambda x: x[0])
-            merged: list[float] = []
-            cursor = 0
-            for offset, chunk_vals in pieces:
-                values = list(chunk_vals)
-                if offset > cursor:
-                    gap = offset - cursor
-                    logger.warning(
-                        "Teacher score chunk gap for sample %d: offset=%d cursor=%d (filling %d NaNs).",
-                        sample_idx,
-                        offset,
-                        cursor,
-                        gap,
-                    )
-                    merged.extend([float("nan")] * gap)
-                    cursor = offset
-                elif offset < cursor:
-                    overlap = cursor - offset
-                    if overlap >= len(values):
-                        logger.warning(
-                            "Teacher score chunk overlap fully skipped for sample %d: offset=%d cursor=%d chunk_len=%d.",
-                            sample_idx,
-                            offset,
-                            cursor,
-                            len(values),
-                        )
-                        continue
-                    logger.warning(
-                        "Teacher score chunk overlap for sample %d: offset=%d cursor=%d (dropping %d tokens).",
-                        sample_idx,
-                        offset,
-                        cursor,
-                        overlap,
-                    )
-                    values = values[overlap:]
-
-                merged.extend(values)
-                cursor += len(values)
-
-            expected_len = teacher_score_expected_len.get(sample_idx)
-            if expected_len is not None and len(merged) != expected_len:
-                if len(merged) > expected_len:
-                    logger.warning(
-                        "Teacher score length overflow for sample %d: expected=%d got=%d (truncating).",
-                        sample_idx,
-                        expected_len,
-                        len(merged),
-                    )
-                    merged = merged[:expected_len]
-                else:
-                    logger.warning(
-                        "Teacher score length underflow for sample %d: expected=%d got=%d (padding NaNs).",
-                        sample_idx,
-                        expected_len,
-                        len(merged),
-                    )
-                    merged.extend([float("nan")] * (expected_len - len(merged)))
-
-            teacher_logprob_by_idx[sample_idx] = merged
+        all_teacher_results.append((tc, logprob_by_idx))
 
     student_rewards = []
     student_zero_count = 0
     student_finite_count = 0
-    teacher_zero_count = 0
-    teacher_finite_count = 0
     results = []
 
     for i, (s_resp, label, fmt) in enumerate(zip(student_responses, labels, answer_formats)):
@@ -1332,39 +1925,38 @@ def run_eval(args):
         student_rewards.append(s_reward)
 
         s_logprobs_raw = student_logprob_by_idx.get(i, [])
-        t_logprobs_raw = teacher_logprob_by_idx.get(i)
+        s_entropies_raw = student_entropy_by_idx.get(i)
         s_token_count = student_response_token_count_by_idx.get(i, 0)
 
+        # Compute common_len across student and all teachers.
         length_candidates = [s_token_count, len(s_logprobs_raw)]
-        if t_logprobs_raw is not None:
-            length_candidates.append(len(t_logprobs_raw))
+        if args.record_student_token_entropy and s_entropies_raw is not None:
+            length_candidates.append(len(s_entropies_raw))
+        for _tc, logprob_by_idx in all_teacher_results:
+            t_lp = logprob_by_idx.get(i)
+            if t_lp is not None:
+                length_candidates.append(len(t_lp))
         common_len = min(length_candidates) if length_candidates else 0
 
-        if s_token_count != common_len or len(s_logprobs_raw) != common_len:
+        if (
+            s_token_count != common_len
+            or len(s_logprobs_raw) != common_len
+            or (args.record_student_token_entropy and s_entropies_raw is not None and len(s_entropies_raw) != common_len)
+        ):
             logger.warning(
-                "Sample %d student logprob length mismatch: tokens=%d, student_lp=%d, using %d",
+                "Sample %d student token-stat length mismatch: tokens=%d, student_lp=%d, student_entropy=%s, using %d",
                 i,
                 s_token_count,
                 len(s_logprobs_raw),
-                common_len,
-            )
-        if t_logprobs_raw is not None and len(t_logprobs_raw) != common_len:
-            logger.warning(
-                "Sample %d teacher logprob length mismatch: teacher_lp=%d, using %d",
-                i,
-                len(t_logprobs_raw),
+                (len(s_entropies_raw) if s_entropies_raw is not None else None),
                 common_len,
             )
 
         s_logprobs = s_logprobs_raw[:common_len]
-        t_logprobs = t_logprobs_raw[:common_len] if t_logprobs_raw is not None else None
+        s_entropies = s_entropies_raw[:common_len] if s_entropies_raw is not None else None
         s_zero, s_finite = _count_zero_logprobs(s_logprobs)
         student_zero_count += s_zero
         student_finite_count += s_finite
-        if t_logprobs is not None:
-            t_zero, t_finite = _count_zero_logprobs(t_logprobs)
-            teacher_zero_count += t_zero
-            teacher_finite_count += t_finite
 
         answer_char_pos = _find_answer_char_start(s_resp)
         thinking_char_pos = _find_thinking_char_start(s_resp)
@@ -1372,6 +1964,26 @@ def run_eval(args):
         thinking_token_start = _char_to_token_position(
             student_scoring_tokenizer, s_resp, thinking_char_pos, common_len
         )
+
+        # Build per-teacher entries.
+        teacher_entries = []
+        for tc, logprob_by_idx in all_teacher_results:
+            t_lp_raw = logprob_by_idx.get(i)
+            if t_lp_raw is not None and len(t_lp_raw) != common_len:
+                logger.warning(
+                    "Sample %d teacher[mode=%s] logprob length mismatch: teacher_lp=%d, using %d",
+                    i, tc["mode"], len(t_lp_raw), common_len,
+                )
+            t_lp = t_lp_raw[:common_len] if t_lp_raw is not None else None
+            teacher_entries.append({
+                "mode": tc["mode"],
+                "api_base": tc["api_base"],
+                "model": tc["model"],
+                "logprobs": t_lp,
+            })
+
+        # Backward compat: expose first teacher's logprobs as teacher_logprobs.
+        first_t_logprobs = teacher_entries[0]["logprobs"] if teacher_entries else None
 
         results.append(
             {
@@ -1384,7 +1996,9 @@ def run_eval(args):
                 "metadata": metadata_list[i],
                 "token_stats": {
                     "student_logprobs": s_logprobs,
-                    "teacher_logprobs": t_logprobs,
+                    "student_entropies": s_entropies,
+                    "teacher_logprobs": first_t_logprobs,
+                    "teachers": teacher_entries,
                     "answer_token_start": answer_token_start,
                     "thinking_token_start": thinking_token_start,
                 },
@@ -1394,15 +2008,11 @@ def run_eval(args):
     n = len(student_rewards)
     student_acc = sum(student_rewards) / n if n else 0.0
     student_zero_ratio = (student_zero_count / student_finite_count) if student_finite_count > 0 else None
-    teacher_zero_ratio = (teacher_zero_count / teacher_finite_count) if teacher_finite_count > 0 else None
 
     if student_zero_ratio is not None:
         logger.info(
             "Student logprob zero ratio: %.2f%% (%d/%d finite tokens, generation temperature=%.4g)",
-            student_zero_ratio * 100.0,
-            student_zero_count,
-            student_finite_count,
-            args.temperature,
+            student_zero_ratio * 100.0, student_zero_count, student_finite_count, args.temperature,
         )
         if student_zero_ratio >= 0.20:
             logger.warning(
@@ -1410,34 +2020,17 @@ def run_eval(args):
                 "This may indicate post-temperature/sampled logprobs rather than original model logprobs.",
                 student_zero_ratio * 100.0,
             )
-    if teacher_zero_ratio is not None:
-        logger.info(
-            "Teacher logprob zero ratio: %.2f%% (%d/%d finite tokens, score temperature=%.4g)",
-            teacher_zero_ratio * 100.0,
-            teacher_zero_count,
-            teacher_finite_count,
-            args.score_temperature,
-        )
-        if teacher_zero_ratio >= 0.20:
-            logger.warning(
-                "High teacher zero-logprob ratio detected (%.2f%%). "
-                "If you need distribution-level logprobs, try score temperature=1.0 and/or "
-                "enable original-logprob mode on the backend.",
-                teacher_zero_ratio * 100.0,
-            )
 
     print(f"\n{'=' * 60}")
     print(f"Dataset : {args.dataset}")
     print(f"Student : {args.model} @ {args.student_api_base}")
-    print(f"Teacher : {teacher_model} @ {args.teacher_api_base}")
-    print(f"Teacher info mode : {args.teacher_info_mode}")
+    for tc in args.teacher_configs:
+        print(f"Teacher[{tc['index']}] : {tc['model']} @ {tc['api_base']}  (mode={tc['mode']})")
     print(f"Samples : {n}")
     print(f"{'=' * 60}")
     print(f"Student accuracy : {student_acc:.4f}  ({sum(student_rewards):.0f}/{n})")
     if student_zero_ratio is not None:
-        print(f"Student zero-logprob ratio              : {student_zero_ratio:.2%}")
-    if teacher_zero_ratio is not None:
-        print(f"Teacher zero-logprob ratio              : {teacher_zero_ratio:.2%}")
+        print(f"Student zero-logprob ratio : {student_zero_ratio:.2%}")
     print(f"{'=' * 60}\n")
 
     if args.output:
@@ -1455,7 +2048,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 
     parser.add_argument("--model", required=True, help="Student API model name.")
-    parser.add_argument("--teacher-model", default=None, help="Teacher API model name. Defaults to --model.")
+    parser.add_argument(
+        "--teacher-model",
+        default=None,
+        nargs="+",
+        help=(
+            "Teacher API model name(s). One per teacher config. If fewer than --teacher-info-mode entries, "
+            "the last value is repeated. Defaults to --model for each config."
+        ),
+    )
 
     parser.add_argument("--dataset", required=True, help="Path to preprocessed JSONL dataset.")
     parser.add_argument("--n-samples", type=int, default=None, help="Randomly sample N rows.")
@@ -1548,24 +2149,46 @@ def main():
         default=os.environ.get("OPENAI_API_KEY") or os.environ.get("STUDENT_API_KEY") or "EMPTY",
         help="API key for the student endpoint.",
     )
-    parser.add_argument("--teacher-api-base", default=None, help="Teacher API base. Defaults to student API base.")
-    parser.add_argument("--teacher-api-key", default=None, help="Teacher API key. Defaults to student API key.")
+    parser.add_argument(
+        "--teacher-api-base",
+        default=None,
+        nargs="+",
+        help=(
+            "Teacher API base URL(s). One per teacher config. If fewer than --teacher-info-mode entries, "
+            "the last value is repeated. Defaults to student API base for each config."
+        ),
+    )
+    parser.add_argument(
+        "--teacher-api-key",
+        default=None,
+        nargs="+",
+        help=(
+            "Teacher API key(s). One per teacher config. If fewer than --teacher-info-mode entries, "
+            "the last value is repeated. Defaults to student API key for each config."
+        ),
+    )
 
+    _TEACHER_INFO_MODES = [
+        "none",
+        "same_as_student",
+        "answer_only",
+        "pi",
+        "full",
+        "masked_reasoning",
+        "conciseness",
+        "hidden_think",
+        "hidden_think_full",
+    ]
     parser.add_argument(
         "--teacher-info-mode",
-        default="answer_only",
-        choices=[
-            "none",
-            "same_as_student",
-            "answer_only",
-            "pi",
-            "full",
-            "masked_reasoning",
-            "conciseness",
-            "hidden_think",
-            "hidden_think_full",
-        ],
-        help="Teacher privileged prompt mode.",
+        default=["answer_only"],
+        nargs="+",
+        choices=_TEACHER_INFO_MODES,
+        help=(
+            "Teacher privileged prompt mode(s). Multiple values define multiple teacher configs that are "
+            "all scored against each student response. E.g.: "
+            "--teacher-info-mode answer_only same_as_student none"
+        ),
     )
     parser.add_argument("--teacher-think-max-tokens", type=int, default=-1)
     parser.add_argument("--mask-ratio", type=float, default=0.5)
@@ -1588,6 +2211,35 @@ def main():
             "`auto` follows student setting; if student is also auto, it uses tokenizer default."
         ),
     )
+    parser.add_argument(
+        "--record-student-token-entropy",
+        default="false",
+        choices=["true", "false"],
+        help="Whether to record per-token entropy for student output.",
+    )
+    parser.add_argument(
+        "--student-token-entropy-mode",
+        default="auto",
+        choices=["auto", "strict_exact", "topk_approx"],
+        help=(
+            "Student entropy source mode: "
+            "`strict_exact` requires backend-provided entropy fields; "
+            "`topk_approx` estimates entropy from top-k logprobs; "
+            "`auto` prefers exact and falls back to top-k approximation."
+        ),
+    )
+    parser.add_argument(
+        "--student-token-entropy-topk",
+        type=int,
+        default=50,
+        help="Top-k count used for `auto` fallback / `topk_approx` student entropy.",
+    )
+    parser.add_argument(
+        "--debug-print-first-student-meta-info",
+        default="false",
+        choices=["true", "false"],
+        help="Print the first student /generate response meta_info for debugging server response format.",
+    )
 
     parser.add_argument("--max-new-tokens", type=int, default=8192, help="Maximum generated tokens.")
     parser.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature.")
@@ -1604,22 +2256,16 @@ def main():
         args.generation_concurrency = args.concurrency
     if args.score_concurrency is None:
         args.score_concurrency = max(1, min(args.concurrency, 8))
-    if args.teacher_api_base is None:
-        args.teacher_api_base = args.student_api_base
-    if args.teacher_api_key is None:
-        args.teacher_api_key = args.student_api_key
+
     args.student_enable_thinking = _parse_enable_thinking_arg(args.student_enable_thinking)
+    args.record_student_token_entropy = _parse_bool_arg(args.record_student_token_entropy)
+    args.debug_print_first_student_meta_info = _parse_bool_arg(args.debug_print_first_student_meta_info)
     if str(args.teacher_enable_thinking).strip().lower() == "auto":
         args.teacher_enable_thinking = args.student_enable_thinking
     else:
         args.teacher_enable_thinking = _parse_enable_thinking_arg(args.teacher_enable_thinking)
-    if args.teacher_enable_thinking and args.teacher_info_mode in {"hidden_think", "hidden_think_full"}:
-        logger.warning(
-            "teacher_enable_thinking=true with %s may create an extra thinking prefix around the "
-            "manually injected <think> prefill. For safety, forcing teacher_enable_thinking=false.",
-            args.teacher_info_mode,
-        )
-        args.teacher_enable_thinking = False
+    # Per-config hidden_think handling is done inside run_eval / _score_with_teacher_config.
+
     args.oom_min_max_new_tokens = max(1, int(args.oom_min_max_new_tokens))
     args.oom_min_score_response_tokens = max(1, int(args.oom_min_score_response_tokens))
     if args.max_score_response_tokens is not None:
@@ -1628,13 +2274,44 @@ def main():
         args.score_chunk_tokens = max(1, int(args.score_chunk_tokens))
     if args.score_context_window_tokens is not None:
         args.score_context_window_tokens = max(1, int(args.score_context_window_tokens))
+    args.student_token_entropy_topk = max(1, int(args.student_token_entropy_topk))
     args.oom_cooldown_seconds = max(0.0, float(args.oom_cooldown_seconds))
-    same_server = _normalize_base_url(args.student_api_base) == _normalize_base_url(args.teacher_api_base)
-    if same_server and args.teacher_info_mode != "none":
-        logger.warning(
-            "Student and teacher endpoints are the same server (%s). Long generation + scoring on one server can trigger OOM.",
-            _normalize_base_url(args.student_api_base),
-        )
+
+    # Build teacher_configs by zipping modes, models, api_bases, api_keys.
+    # Each list is padded to the length of teacher_info_mode by repeating its last element.
+    modes: list[str] = args.teacher_info_mode  # already a list (nargs='+')
+    n_teachers = len(modes)
+
+    def _pad(lst, n, default):
+        if not lst:
+            return [default] * n
+        return list(lst) + [lst[-1]] * (n - len(lst))
+
+    teacher_models_list = _pad(args.teacher_model, n_teachers, None)
+    teacher_api_bases_list = _pad(args.teacher_api_base, n_teachers, None)
+    teacher_api_keys_list = _pad(args.teacher_api_key, n_teachers, None)
+
+    args.teacher_configs = []
+    for i, mode in enumerate(modes):
+        model = teacher_models_list[i] or args.model
+        api_base = teacher_api_bases_list[i] or args.student_api_base
+        api_key = teacher_api_keys_list[i] or args.student_api_key
+        args.teacher_configs.append({
+            "index": i,
+            "mode": mode,
+            "model": model,
+            "api_base": api_base,
+            "api_key": api_key,
+        })
+
+    for tc in args.teacher_configs:
+        same_server = _normalize_base_url(args.student_api_base) == _normalize_base_url(tc["api_base"])
+        if same_server and tc["mode"] != "none":
+            logger.warning(
+                "Teacher config %d (mode=%s): teacher endpoint is the same server as student (%s). "
+                "Long generation + scoring on one server can trigger OOM.",
+                tc["index"], tc["mode"], _normalize_base_url(args.student_api_base),
+            )
     if args.max_new_tokens >= 8192:
         logger.warning(
             "max_new_tokens=%d is high. If OOM persists, try reducing to 2048/4096 or set --max-score-response-tokens.",
@@ -1663,6 +2340,12 @@ def main():
         "Chat template enable_thinking: student=%s, teacher=%s",
         _format_enable_thinking(args.student_enable_thinking),
         _format_enable_thinking(args.teacher_enable_thinking),
+    )
+    logger.info(
+        "Student token entropy: record=%s, mode=%s, topk=%d",
+        args.record_student_token_entropy,
+        args.student_token_entropy_mode,
+        args.student_token_entropy_topk,
     )
     run_eval(args)
 

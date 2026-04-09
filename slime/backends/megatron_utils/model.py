@@ -731,6 +731,7 @@ def train_one_step(
                 "rollout_log_probs",
                 "max_seq_lens",
                 "teacher_log_probs",
+                "opd_distill_sample_mask",
                 "opd_topk_token_ids",
                 "opd_topk_teacher_log_probs",
                 "teacher_tokens",

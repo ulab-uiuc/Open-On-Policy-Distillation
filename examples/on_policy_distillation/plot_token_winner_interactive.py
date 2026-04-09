@@ -17,6 +17,31 @@ Usage:
     --tokenizer Qwen/Qwen3-1.7B
 
 
+
+
+python examples/on_policy_distillation/plot_token_winner_interactive.py \
+  --input eval_dapo_student_teacher_inference_all_thinking_b16.jsonl \
+  --output ./token_winner_interactive.html \
+  --tokenizer Qwen/Qwen3-1.7B \
+  --show-last-k-tokens 128
+
+
+
+python examples/on_policy_distillation/plot_token_winner_interactive.py \
+  --input ./eval_openthoughts_student_teacher_inference_all_thinking_b16.jsonl \
+  --output ./token_winner_interactive_heheda.html \
+  --tokenizer Qwen/Qwen3-1.7B \
+  --show-last-k-tokens 64
+
+  
+python examples/on_policy_distillation/plot_token_winner_interactive.py \
+  --input ./eval_openthoughts_student_teacher_inference_all_nothinking_b16.jsonl \
+  --output ./token_winner_interactive_heheda.html \
+  --tokenizer Qwen/Qwen3-1.7B \
+  --show-last-k-tokens 64
+
+
+  
 python examples/on_policy_distillation/plot_token_winner_interactive.py \
   --input ./eval_math500_student_teacher_inference.jsonl \
   --output ./token_winner_interactive.html \
@@ -194,8 +219,39 @@ def _normalize_token_list(values, n: int) -> list[str]:
     return out
 
 
+def _make_unicode_to_bytes() -> dict:
+    """Reverse the GPT-2 / Qwen2 bytes_to_unicode mapping.
+
+    bytes_to_unicode maps every byte 0-255 to a printable Unicode character.
+    Printable ASCII (33-126) and Latin-1 printable (161-172, 174-255) map to
+    themselves; the remaining 66 bytes map to U+0100-U+0141.
+    We reverse this so we can recover the original bytes from a raw vocab entry.
+    """
+    bs = (list(range(ord('!'), ord('~') + 1)) +
+          list(range(ord('¡'), ord('¬') + 1)) +
+          list(range(ord('®'), ord('ÿ') + 1)))
+    cs = list(bs)
+    extra = 0
+    for b in range(256):
+        if b not in bs:
+            bs.append(b)
+            cs.append(256 + extra)
+            extra += 1
+    return {chr(c): byte for byte, c in zip(bs, cs)}
+
+
+_UNICODE_TO_BYTES: dict = _make_unicode_to_bytes()
+
+
 def _decode_ids_to_text_tokens(tokenizer, token_ids: list[int], n: int) -> list[str]:
-    """Decode token ids into human-readable token text pieces."""
+    """Decode token ids into human-readable token text pieces.
+
+    Primary path: tokenizer.decode([id]) — correct for complete Unicode tokens.
+    Fallback for U+FFFD (partial UTF-8 byte tokens): use convert_ids_to_tokens()
+    to get the raw GPT-2-style vocab entry, reverse the bytes_to_unicode mapping
+    to recover the original bytes, then decode as UTF-8.  This handles tokens
+    like a single byte of a multi-byte Chinese character gracefully.
+    """
     out = []
     for tid in token_ids[:n]:
         try:
@@ -204,6 +260,15 @@ def _decode_ids_to_text_tokens(tokenizer, token_ids: list[int], n: int) -> list[
                 skip_special_tokens=False,
                 clean_up_tokenization_spaces=False,
             )
+            if '\ufffd' in piece:
+                # Byte-level token: recover via bytes_to_unicode reverse map
+                raw_list = tokenizer.convert_ids_to_tokens([int(tid)])
+                raw = raw_list[0] if raw_list else ''
+                try:
+                    byte_seq = bytes([_UNICODE_TO_BYTES[c] for c in raw])
+                    piece = byte_seq.decode('utf-8', errors='replace')
+                except Exception:
+                    piece = f'<0x{int(tid):04x}>'
         except Exception:
             piece = str(tid)
         out.append(piece)
@@ -490,7 +555,7 @@ def _extract_question_text(rec: dict) -> str:
     """Best-effort question text extraction for per-request detail header."""
     metadata = rec.get("metadata")
     if isinstance(metadata, dict):
-        for key in ("question", "problem", "query", "instruction", "prompt"):
+        for key in ("question", "problem", "raw_problem", "query", "instruction", "prompt", "student_user_content", "raw_content"):
             value = metadata.get(key)
             if isinstance(value, str) and value.strip():
                 return value.strip()
@@ -516,31 +581,66 @@ def _extract_question_text(rec: dict) -> str:
     return "(Question text not available in record)"
 
 
+def _get_teacher_configs_from_records(records: list[dict]) -> list[dict]:
+    """Detect teacher configurations from the first record that has a non-empty `teachers` list."""
+    for rec in records:
+        ts = rec.get("token_stats") or {}
+        teachers = ts.get("teachers")
+        if isinstance(teachers, list) and teachers:
+            configs = []
+            for i, t in enumerate(teachers):
+                mode = t.get("mode") or "unknown"
+                model = t.get("model") or ""
+                model_short = model.rstrip("/").split("/")[-1] if model else f"t{i}"
+                label = f"{model_short} [{mode}]"
+                configs.append({"index": i, "mode": mode, "model": model, "label": label})
+            return configs
+    # Fall back to single legacy teacher
+    return [{"index": 0, "mode": "teacher", "model": "", "label": "teacher"}]
+
+
+def _get_teacher_logprobs_array(ts: dict, config: dict) -> np.ndarray:
+    """Extract logprob array for a teacher config from token_stats."""
+    teachers = ts.get("teachers")
+    if isinstance(teachers, list):
+        i = config["index"]
+        if i < len(teachers):
+            return as_float_array(teachers[i].get("logprobs"))
+    return as_float_array(ts.get("teacher_logprobs"))
+
+
 def build_heatmap_data(
     records: list[dict],
     tokenizer=None,
     n_bins: int = 0,
     first_k_tokens: int | None = None,
     last_k_tokens: int | None = None,
-) -> tuple:  # n_bins unused, kept for CLI compat
+) -> dict:  # n_bins unused, kept for CLI compat
     """
-    Returns:
-      heatmap_rows  : list of lists (n_records x max_tokens), exact per-token delta
-      row_labels    : list of str
-      rewards       : list of float/int/None
-      x_positions   : list of int (1-indexed token positions)
-      detail_data   : list of dicts for per-request detail view
-      max_tokens    : int
-      token_rows    : list of lists (n_records x max_tokens), per-position token text
-      window_desc   : str, display description for selected token window
+    Returns a dict with keys:
+      teacher_configs          : list of {index, mode, model, label} — one per teacher
+      heatmap_rows_per_teacher : list (per teacher) of list (per record) of per-token delta rows
+      row_labels               : list of str
+      rewards                  : list of float/int/None
+      x_positions              : list of int (1-indexed token positions)
+      detail_data              : list of dicts — each includes a `teachers` list with per-teacher data
+      max_tokens               : int
+      token_rows               : list of lists (n_records x max_tokens), per-position token text
+      window_desc              : str
     """
-    # First pass: find max tokens
+    teacher_configs = _get_teacher_configs_from_records(records)
+    n_teachers = len(teacher_configs)
+
+    # First pass: find max tokens (use the minimum length across student + all teachers)
     max_tokens = 0
     for rec in records:
         ts = rec.get("token_stats") or {}
         s = as_float_array(ts.get("student_logprobs"))
-        t = as_float_array(ts.get("teacher_logprobs"))
-        n_full = _effective_token_count_without_trailing_empty(rec, min(s.size, t.size))
+        t_arrays = [_get_teacher_logprobs_array(ts, tc) for tc in teacher_configs]
+        valid_sizes = [s.size] + [t.size for t in t_arrays if t.size > 0]
+        if not valid_sizes:
+            continue
+        n_full = _effective_token_count_without_trailing_empty(rec, min(valid_sizes))
         if first_k_tokens is not None:
             n = min(n_full, first_k_tokens)
         elif last_k_tokens is not None:
@@ -549,8 +649,12 @@ def build_heatmap_data(
             n = n_full
         max_tokens = max(max_tokens, n)
 
+    _EMPTY = {"teacher_configs": teacher_configs,
+               "heatmap_rows_per_teacher": [[] for _ in teacher_configs],
+               "row_labels": [], "rewards": [], "x_positions": [],
+               "detail_data": [], "max_tokens": 0, "token_rows": [], "window_desc": "all tokens"}
     if max_tokens == 0:
-        return [], [], [], [], [], 0, [], "all tokens"
+        return _EMPTY
 
     if first_k_tokens is not None:
         window_desc = f"first {first_k_tokens} tokens per request"
@@ -560,56 +664,64 @@ def build_heatmap_data(
         window_desc = "all tokens"
 
     x_positions = list(range(1, max_tokens + 1))
-
-    heatmap_rows = []
-    row_labels = []
-    rewards = []
-    detail_data = []
-    token_rows = []
+    heatmap_rows_per_teacher: list[list] = [[] for _ in teacher_configs]
+    row_labels: list[str] = []
+    rewards: list = []
+    detail_data: list[dict] = []
+    token_rows: list[list] = []
 
     for rec in records:
         ts = rec.get("token_stats") or {}
         s = as_float_array(ts.get("student_logprobs"))
-        t = as_float_array(ts.get("teacher_logprobs"))
-        n_full = _effective_token_count_without_trailing_empty(rec, min(s.size, t.size))
+        t_arrays = [_get_teacher_logprobs_array(ts, tc) for tc in teacher_configs]
+        valid_sizes = [s.size] + [t.size for t in t_arrays if t.size > 0]
+        if not valid_sizes:
+            continue
+        n_full = _effective_token_count_without_trailing_empty(rec, min(valid_sizes))
         if n_full == 0:
             continue
 
         if first_k_tokens is not None:
-            start = 0
-            end = min(n_full, first_k_tokens)
+            start, end = 0, min(n_full, first_k_tokens)
         elif last_k_tokens is not None:
             end = n_full
             start = max(0, n_full - last_k_tokens)
         else:
-            start = 0
-            end = n_full
+            start, end = 0, n_full
         n = end - start
         if n <= 0:
             continue
 
-        delta = t[start:end] - s[start:end]
+        # Per-teacher deltas (nan-filled when teacher array absent/short)
+        deltas = []
+        t_slices = []
+        for t in t_arrays:
+            if t.size >= end:
+                t_sl = t[start:end]
+            elif t.size > start:
+                t_sl = np.concatenate([t[start:], np.full(end - t.size, float("nan"))])
+            else:
+                t_sl = np.full(n, float("nan"))
+            t_slices.append(t_sl)
+            deltas.append(t_sl - s[start:end])
+
         reward = rec.get("student_reward", rec.get("reward"))
-        idx = rec.get("index", len(heatmap_rows))
+        idx = rec.get("index", len(row_labels))
         question_text = _extract_question_text(rec)
         response_text = str(rec.get("student_response", "") or "")
 
-        # Exact per-token delta; pad shorter responses with None
-        row = []
-        for i in range(max_tokens):
-            if i < n and np.isfinite(delta[i]):
-                row.append(float(delta[i]))
-            else:
-                row.append(None)
-
-        heatmap_rows.append(row)
+        # Extract token texts; trim trailing empty (e.g. EOS counted in logprobs)
         tokens = _extract_token_texts_from_record(rec, start=start, end=end, tokenizer=tokenizer)
-        token_row = []
-        for i in range(max_tokens):
-            token_row.append(tokens[i] if i < n else None)
-        token_rows.append(token_row)
+        effective_n = len(tokens)
+        while effective_n > 0 and not tokens[effective_n - 1]:
+            effective_n -= 1
+        if effective_n < n:
+            n = effective_n
+            end = start + n
+            deltas = [d[:n] for d in deltas]
+            t_slices = [t[:n] for t in t_slices]
+            tokens = tokens[:n]
 
-        # Reward display
         if reward is None:
             r_str = "?"
         else:
@@ -617,16 +729,47 @@ def build_heatmap_data(
         row_labels.append(f"[{r_str}] req {idx}")
         rewards.append(reward)
 
-        finite_delta = delta[np.isfinite(delta)]
-        if finite_delta.size > 0:
-            teacher_win_rate = float(np.mean(finite_delta > 0) * 100.0)
-            mean_delta = float(np.mean(finite_delta))
-        else:
-            teacher_win_rate = None
-            mean_delta = None
+        # Heatmap rows: one row per teacher, padded to max_tokens
+        for ti, delta in enumerate(deltas):
+            row = []
+            for i in range(max_tokens):
+                if i < n and np.isfinite(delta[i]):
+                    row.append(float(delta[i]))
+                else:
+                    row.append(None)
+            heatmap_rows_per_teacher[ti].append(row)
 
-        # Detail data — trim to avoid massive HTML; keep full arrays up to 4096 tokens
+        token_row = [tokens[i] if i < n else None for i in range(max_tokens)]
+        token_rows.append(token_row)
+
+        # Per-teacher detail entries
         cap = 99999
+        teachers_detail = []
+        for ti, (tc, delta, t_sl) in enumerate(zip(teacher_configs, deltas, t_slices)):
+            finite_delta = delta[np.isfinite(delta)]
+            if finite_delta.size > 0:
+                t_win_rate = float(np.mean(finite_delta > 0) * 100.0)
+                t_mean_delta = float(np.mean(finite_delta))
+            else:
+                t_win_rate = None
+                t_mean_delta = None
+            teachers_detail.append({
+                "label": tc["label"],
+                "mode": tc["mode"],
+                "model": tc["model"],
+                "logprobs": t_sl[:min(n, cap)].tolist(),
+                "delta": delta[:min(n, cap)].tolist(),
+                "teacher_win_rate_pct": t_win_rate,
+                "mean_delta": t_mean_delta,
+            })
+
+        # Backward-compat: first teacher's fields at the top level
+        first_delta = deltas[0] if deltas else np.array([])
+        first_t_sl = t_slices[0] if t_slices else np.array([])
+        finite_first = first_delta[np.isfinite(first_delta)] if first_delta.size > 0 else np.array([])
+        teacher_win_rate = float(np.mean(finite_first > 0) * 100.0) if finite_first.size > 0 else None
+        mean_delta_val = float(np.mean(finite_first)) if finite_first.size > 0 else None
+
         detail_data.append({
             "idx": idx,
             "reward": reward,
@@ -634,12 +777,13 @@ def build_heatmap_data(
             "question_text": question_text,
             "student_response_text": response_text,
             "student_logprobs": s[start:min(end, start + cap)].tolist(),
-            "teacher_logprobs": t[start:min(end, start + cap)].tolist(),
-            "delta": delta[:min(n, cap)].tolist(),
+            "teacher_logprobs": first_t_sl[:min(n, cap)].tolist(),  # backward compat
+            "delta": first_delta[:min(n, cap)].tolist(),             # backward compat
+            "teachers": teachers_detail,
             "tokens": tokens[:min(n, cap)],
             "n": min(n, cap),
             "teacher_win_rate_pct": teacher_win_rate,
-            "mean_delta": mean_delta,
+            "mean_delta": mean_delta_val,
             "window_start_1idx": start + 1,
             "window_end_1idx": min(end, start + cap),
             "n_full": n_full,
@@ -648,28 +792,41 @@ def build_heatmap_data(
             "thinking_token_end": _remap_marker_to_window(ts.get("thinking_token_end"), start, end),
         })
 
-    return heatmap_rows, row_labels, rewards, x_positions, detail_data, max_tokens, token_rows, window_desc
+    return {
+        "teacher_configs": teacher_configs,
+        "heatmap_rows_per_teacher": heatmap_rows_per_teacher,
+        "row_labels": row_labels,
+        "rewards": rewards,
+        "x_positions": x_positions,
+        "detail_data": detail_data,
+        "max_tokens": max_tokens,
+        "token_rows": token_rows,
+        "window_desc": window_desc,
+    }
 
 
 def generate_html(
-    heatmap_rows: list,
-    row_labels: list,
-    rewards: list,
-    x_positions: list,
-    detail_data: list,
-    max_tokens: int,
-    token_rows: list,
-    window_desc: str,
+    data: dict,
     boxed_stats: dict,
     plotly_js_src: str | None = None,
 ) -> str:
-    # Compute symmetric color range
+    teacher_configs = data["teacher_configs"]
+    heatmap_rows_per_teacher = data["heatmap_rows_per_teacher"]
+    row_labels = data["row_labels"]
+    rewards = data["rewards"]
+    x_positions = data["x_positions"]
+    detail_data = data["detail_data"]
+    max_tokens = data["max_tokens"]
+    token_rows = data["token_rows"]
+    window_desc = data["window_desc"]
+
     abs_max = 1.0  # color range fixed to [-1, 1]; values outside saturate to extreme colors
 
-    n_records = len(heatmap_rows)
+    n_records = len(row_labels)
     heatmap_height = max(320, min(12000, n_records * 18 + 140))
 
-    heatmap_json = json.dumps(heatmap_rows)
+    teacher_configs_json = json.dumps(teacher_configs)
+    all_heatmap_rows_json = json.dumps(heatmap_rows_per_teacher)
     labels_json = json.dumps(row_labels)
     rewards_json = json.dumps(rewards)
     x_positions_json = json.dumps(x_positions)
@@ -692,23 +849,18 @@ def generate_html(
   {plotly_script_tag}
   <style>
     :root {{
-      --bg: #edf0f4;
-      --card: #ffffff;
-      --border: #d9e0e9;
-      --text: #1d2430;
-      --muted: #586376;
-      --accent: #3d5a80;
-      --shadow: 0 8px 24px rgba(26, 32, 44, 0.08);
+      --bg: #edf0f4; --card: #ffffff; --border: #d9e0e9;
+      --text: #1d2430; --muted: #586376; --accent: #3d5a80;
+      --shadow: 0 8px 24px rgba(26,32,44,0.08);
     }}
     * {{ box-sizing: border-box; }}
     body {{
-      margin: 0;
-      padding: 16px;
+      margin: 0; padding: 16px;
       background:
-        radial-gradient(circle at 90% -10%, rgba(176, 196, 222, 0.40), rgba(176, 196, 222, 0) 30%),
+        radial-gradient(circle at 90% -10%, rgba(176,196,222,.40), rgba(176,196,222,0) 30%),
         linear-gradient(180deg, #f4f6fa 0%, var(--bg) 100%);
       color: var(--text);
-      font-family: "IBM Plex Sans", "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+      font-family: "IBM Plex Sans","Segoe UI","Helvetica Neue",Arial,sans-serif;
       line-height: 1.45;
     }}
     .page {{ max-width: 1380px; margin: 0 auto; }}
@@ -716,48 +868,14 @@ def generate_html(
     .subtitle {{ margin-top: 6px; color: var(--muted); font-size: 0.92rem; }}
     .legend {{ display: flex; gap: 16px; align-items: center; margin-top: 12px; flex-wrap: wrap; }}
     .legend-item {{ display: flex; align-items: center; gap: 7px; font-size: 0.86rem; color: #293344; }}
-    .swatch {{ width: 22px; height: 14px; border-radius: 4px; border: 1px solid rgba(0,0,0,0.08); flex-shrink: 0; }}
-    .colorbar-card {{
-      margin-top: 10px;
-      padding: 10px 12px;
-      border: 1px solid #dbe3ee;
-      border-radius: 10px;
-      background: #f8fbfd;
-    }}
-    .colorbar-title {{ font-size: 0.82rem; color: #455269; margin-bottom: 6px; font-weight: 600; }}
-    .colorbar-gradient {{
-      width: 100%;
-      height: 14px;
-      border-radius: 8px;
-      border: 1px solid rgba(0,0,0,0.12);
-      background: linear-gradient(to right, #1a7a1a 0%, #ebf6eb 48%, #ffffff 50%, #fdeeee 52%, #8b0000 100%);
-    }}
-    .colorbar-ticks {{
-      display: flex;
-      justify-content: space-between;
-      margin-top: 5px;
-      font-size: 0.78rem;
-      color: #4d5a70;
-      font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-    }}
-    .colorbar-desc {{
-      display: flex;
-      justify-content: space-between;
-      gap: 10px;
-      margin-top: 6px;
-      font-size: 0.8rem;
-      color: #3f4c62;
-    }}
+    .swatch {{ width: 22px; height: 14px; border-radius: 4px; border: 1px solid rgba(0,0,0,.08); flex-shrink: 0; }}
     .card {{
-      background: var(--card);
-      border: 1px solid var(--border);
-      border-radius: 14px;
-      box-shadow: var(--shadow);
-      padding: 14px;
-      margin-top: 14px;
+      background: var(--card); border: 1px solid var(--border); border-radius: 14px;
+      box-shadow: var(--shadow); padding: 14px; margin-top: 14px;
     }}
-    .section-title {{ margin: 0 0 8px; font-size: 1rem; font-weight: 650; }}
-    .hint {{ color: #5d697d; font-size: 0.83rem; }}
+    .section-title {{ margin: 0 0 6px; font-size: 1rem; font-weight: 650; }}
+    .section-subtitle {{ font-size: 0.9rem; font-weight: 600; margin: 6px 0 4px; }}
+    .hint {{ color: #5d697d; font-size: 0.83rem; margin-bottom: 8px; }}
     #stats {{ font-size: 0.87rem; color: #39465a; margin-bottom: 10px; line-height: 1.5; }}
     #boxed-summary {{ font-size: 0.86rem; color: #2f3948; line-height: 1.5; }}
     .boxed-table {{ width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 0.83rem; }}
@@ -766,128 +884,95 @@ def generate_html(
     #overview-section {{ display: block; }}
     #detail-page {{ display: none; }}
     .nav-row {{
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      flex-wrap: wrap;
-      margin-bottom: 10px;
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 12px; flex-wrap: wrap; margin-bottom: 10px;
     }}
-    .nav-controls {{
-      display: flex;
-      gap: 8px;
-      align-items: center;
-      flex-wrap: wrap;
-    }}
+    .nav-controls {{ display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }}
     button, select {{
-      font: inherit;
-      border: 1px solid #c6d0df;
-      background: #ffffff;
-      color: #1f2937;
-      border-radius: 8px;
-      padding: 6px 10px;
+      font: inherit; border: 1px solid #c6d0df; background: #ffffff;
+      color: #1f2937; border-radius: 8px; padding: 6px 10px;
     }}
-    button {{
-      cursor: pointer;
-      transition: background 0.16s ease, border-color 0.16s ease;
-    }}
+    button {{ cursor: pointer; transition: background .16s ease, border-color .16s ease; }}
     button:hover {{ background: #f3f6fa; border-color: #aebbd0; }}
-    button:disabled {{ opacity: 0.45; cursor: not-allowed; }}
+    button:disabled {{ opacity: .45; cursor: not-allowed; }}
     #detail-title {{ font-size: 1rem; font-weight: 650; color: #1f2a3b; }}
-    .detail-grid {{
-      display: grid;
-      grid-template-columns: repeat(5, minmax(0, 1fr));
-      gap: 8px;
-      margin: 10px 0 12px;
+    /* Metrics area */
+    .detail-metrics-base {{
+      display: grid; grid-template-columns: repeat(3, minmax(0,1fr));
+      gap: 8px; margin: 10px 0 6px;
     }}
+    .teacher-metric-row {{ display: flex; flex-wrap: wrap; gap: 8px; margin: 4px 0 12px; }}
     .metric {{
-      border: 1px solid #dde4ed;
-      border-radius: 10px;
-      background: #f9fbfd;
-      padding: 8px 9px;
+      border: 1px solid #dde4ed; border-radius: 10px;
+      background: #f9fbfd; padding: 8px 9px;
     }}
     .metric .label {{ font-size: 0.76rem; color: #5f6c80; margin-bottom: 2px; }}
     .metric .value {{ font-size: 0.89rem; font-weight: 600; color: #202b3c; }}
+    /* Detail legend + question */
+    #detail-legend {{
+      padding: 6px 10px; background: #f4f7fb;
+      border: 1px solid #dde4ed; border-bottom: none; border-radius: 10px 10px 0 0;
+    }}
     #question-block {{
-      border: 1px solid #dde4ed;
-      border-radius: 10px;
-      background: #f9fbfd;
-      padding: 10px;
-      margin-bottom: 12px;
+      border: 1px solid #dde4ed; border-radius: 0 0 10px 10px;
+      background: #f9fbfd; padding: 10px; margin-bottom: 12px;
     }}
     #question-title {{ font-size: 0.83rem; color: #4f5d73; margin-bottom: 4px; font-weight: 600; }}
     #question-text {{
       margin: 0;
-      font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-      font-size: 12px;
-      line-height: 1.42;
-      max-height: 220px;
-      overflow: auto;
-      white-space: pre-wrap;
-      word-break: break-word;
+      font-family: "IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono",monospace;
+      font-size: 12px; line-height: 1.42; max-height: 220px;
+      overflow: auto; white-space: pre-wrap; word-break: break-word;
     }}
-    #token-wall {{
-      width: 100%;
-      min-height: 78vh;
-      border: 1px solid #dde4ed;
-      border-radius: 12px;
-      background: #f8fafd;
-      padding: 10px;
-      overflow: auto;
-      display: flex;
-      flex-wrap: wrap;
-      align-content: flex-start;
-      gap: 6px;
+    /* Multi-teacher token wall */
+    #multi-teacher-wall {{
+      width: 100%; border: 1px solid #dde4ed; border-radius: 12px;
+      background: #f8fafd; padding: 10px; overflow: auto;
     }}
+    .teacher-wall-section {{ margin-bottom: 14px; }}
+    .teacher-wall-section:last-child {{ margin-bottom: 0; }}
+    .teacher-wall-label {{
+      font-size: 0.83rem; font-weight: 600; color: #1d2430;
+      border-left: 3px solid #888; padding: 2px 0 2px 8px; margin-bottom: 6px;
+    }}
+    .teacher-chips-row {{
+      display: flex; flex-wrap: wrap; gap: 4px; align-content: flex-start;
+    }}
+    /* Token chips */
     .token-chip {{
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      padding: 5px 8px;
-      border-radius: 8px;
-      border: 1px solid rgba(0, 0, 0, 0.08);
-      font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-      font-size: 12px;
-      line-height: 1.25;
-      white-space: pre-wrap;
-      word-break: break-word;
-      max-width: 100%;
+      display: inline-flex; align-items: center; gap: 5px; padding: 4px 7px;
+      border-radius: 8px; border: 1px solid rgba(0,0,0,.08);
+      font-family: "IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono",monospace;
+      font-size: 12px; line-height: 1.25; white-space: pre-wrap;
+      word-break: break-word; max-width: 100%;
     }}
-    .token-pos {{
-      font-size: 10px;
-      opacity: 0.75;
-      flex-shrink: 0;
+    .token-pos {{ font-size: 10px; opacity: .75; flex-shrink: 0; }}
+    .token-text {{ overflow-wrap: anywhere; }}
+    /* Delta selector */
+    .delta-selector {{
+      display: flex; gap: 6px; margin: 8px 0; flex-wrap: wrap; align-items: center;
+      font-size: 0.83rem; color: #4f5d73;
     }}
-    .token-text {{
-      overflow-wrap: anywhere;
-    }}
+    .delta-btn {{ font-size: 0.78rem; padding: 3px 9px; border-radius: 6px; }}
+    .delta-btn.active {{ color: #fff !important; }}
+    /* Detail chart + preview */
     #detail-chart {{ width: 100%; height: 500px; margin-top: 10px; }}
     #token-preview {{
-      margin-top: 10px;
-      border: 1px solid #dde4ed;
-      border-radius: 10px;
-      background: #f9fbfd;
-      padding: 9px;
-      max-height: 240px;
-      overflow: auto;
-      font-size: 12px;
-      line-height: 1.4;
-      white-space: pre-wrap;
-      word-break: break-word;
-      font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      margin-top: 10px; border: 1px solid #dde4ed; border-radius: 10px;
+      background: #f9fbfd; padding: 9px; max-height: 240px; overflow: auto;
+      font-size: 12px; line-height: 1.4; white-space: pre-wrap; word-break: break-word;
+      font-family: "IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono",monospace;
     }}
     @media (max-width: 1100px) {{
-      .detail-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+      .detail-metrics-base {{ grid-template-columns: repeat(2, minmax(0,1fr)); }}
       #detail-chart {{ height: 440px; }}
-      #token-wall {{ min-height: 72vh; }}
     }}
     @media (max-width: 768px) {{
       body {{ padding: 12px; }}
-      .detail-grid {{ grid-template-columns: 1fr; }}
+      .detail-metrics-base {{ grid-template-columns: 1fr; }}
       .nav-row {{ align-items: flex-start; }}
       .nav-controls {{ width: 100%; }}
       #detail-chart {{ height: 400px; }}
-      #token-wall {{ min-height: 66vh; }}
     }}
   </style>
 </head>
@@ -896,45 +981,16 @@ def generate_html(
     <h1>Teacher vs Student Token Logprob Explorer</h1>
     <div class="subtitle">
       Color encodes <strong>teacher logprob − student logprob</strong> at each token position.
-      Keep the overview heatmap for global comparison, then open one request in an independent detail view.
-    </div>
-    <div class="legend">
-      <div class="legend-item">
-        <div class="swatch" style="background: linear-gradient(to right, #8b0000, #f0b1b1);"></div>
-        <span><strong>Red</strong>: teacher stronger (Δ &gt; 0)</span>
-      </div>
-      <div class="legend-item">
-        <div class="swatch" style="background: linear-gradient(to right, #e8f5e8, #1a7a1a);"></div>
-        <span><strong>Green</strong>: student stronger (Δ &lt; 0)</span>
-      </div>
-      <div class="legend-item">
-        <div class="swatch" style="background: #ffffff;"></div>
-        <span>White: near tie (Δ ≈ 0)</span>
-      </div>
-    </div>
-    <div class="colorbar-card">
-      <div class="colorbar-title">Color Direction & Magnitude for Δ = teacher logprob − student logprob</div>
-      <div class="colorbar-gradient"></div>
-      <div class="colorbar-ticks">
-        <span>-{abs_max:.1f}</span>
-        <span>0</span>
-        <span>+{abs_max:.1f}</span>
-      </div>
-      <div class="colorbar-desc">
-        <span>Student stronger (green)</span>
-        <span>Teacher stronger (red)</span>
-      </div>
+      Red = teacher stronger · Green = student stronger · White = near tie.
     </div>
 
-    <div class="card">
-      <div id="boxed-summary"></div>
-    </div>
+    <div class="card"><div id="boxed-summary"></div></div>
 
     <div class="card" id="overview-section">
-      <h2 class="section-title">Overview Heatmap</h2>
+      <h2 class="section-title">Overview Heatmaps (one per teacher)</h2>
       <div id="stats"></div>
-      <div class="hint">Click any heatmap row to open an independent per-question detail page below.</div>
-      <div id="heatmap" style="width:100%; height:{heatmap_height}px;"></div>
+      <div class="hint">Click any heatmap row to open an independent per-question detail view below.</div>
+      <div id="heatmap-container"></div>
     </div>
 
     <div class="card" id="detail-page">
@@ -948,12 +1004,38 @@ def generate_html(
           <select id="req-select"></select>
         </div>
       </div>
-      <div class="detail-grid" id="detail-summary"></div>
+      <div class="detail-metrics-base" id="detail-summary-base"></div>
+      <div class="teacher-metric-row" id="detail-summary-teachers"></div>
+      <div id="detail-legend">
+        <div class="legend" style="margin-top:0; margin-bottom:6px;">
+          <div class="legend-item">
+            <div class="swatch" style="background:linear-gradient(to right,#8b0000,#f0b1b1);"></div>
+            <span><strong>Red</strong>: teacher stronger (Δ &gt; 0)</span>
+          </div>
+          <div class="legend-item">
+            <div class="swatch" style="background:linear-gradient(to right,#e8f5e8,#1a7a1a);"></div>
+            <span><strong>Green</strong>: student stronger (Δ &lt; 0)</span>
+          </div>
+          <div class="legend-item">
+            <div class="swatch" style="background:#ffffff; border:1px solid #ccc;"></div>
+            <span>White: near tie (Δ ≈ 0)</span>
+          </div>
+          <div class="legend-item" style="margin-left:8px; gap:0; flex-direction:column; align-items:flex-start;">
+            <span style="font-size:.75rem; color:#5f6c80; margin-bottom:2px;">Δ = teacher − student logprob</span>
+            <div style="display:flex; align-items:center; gap:4px;">
+              <span style="font-size:.75rem; color:#1a7a1a;">−{abs_max:.1f}</span>
+              <div style="width:80px; height:10px; border-radius:3px; background:linear-gradient(to right,#1a7a1a,#ffffff,#8b0000); border:1px solid rgba(0,0,0,.1);"></div>
+              <span style="font-size:.75rem; color:#8b0000;">+{abs_max:.1f}</span>
+            </div>
+          </div>
+        </div>
+      </div>
       <div id="question-block">
         <div id="question-title">Question</div>
         <pre id="question-text"></pre>
       </div>
-      <div id="token-wall"></div>
+      <div id="multi-teacher-wall"></div>
+      <div id="delta-selector-bar"></div>
       <div id="detail-chart"></div>
       <div id="token-preview"></div>
     </div>
@@ -961,7 +1043,8 @@ def generate_html(
 
   <script>
   (function() {{
-    var Z = {heatmap_json};
+    var teacherConfigs = {teacher_configs_json};
+    var allHeatmapRows = {all_heatmap_rows_json};
     var yLabels = {labels_json};
     var rewards = {rewards_json};
     var xCenters = {x_positions_json};
@@ -971,6 +1054,10 @@ def generate_html(
     var boxedStats = {boxed_stats_json};
     var absMax = {abs_max:.6f};
     var currentRowIdx = null;
+    var currentDetailTeacherIdx = 0;
+
+    // Distinct colors for up to 6 teachers; teacher 0 reuses the legacy orange
+    var TEACHER_COLORS = ['#d17a20', '#c0392b', '#8e44ad', '#16a085', '#2980b9', '#7f8c8d'];
 
     var colorscale = [
       [0.00, '#1a7a1a'],
@@ -1016,52 +1103,36 @@ def generate_html(
       return Number(relativePos) + Number(windowStart) - 1;
     }}
 
-    function clamp(v, lo, hi) {{
-      return Math.max(lo, Math.min(hi, v));
-    }}
+    function clamp(v, lo, hi) {{ return Math.max(lo, Math.min(hi, v)); }}
 
     function deltaToChipStyle(delta) {{
-      if (!isFinite(delta)) {{
-        return {{ bg: 'rgba(140,140,140,0.18)', fg: '#111111' }};
-      }}
+      if (!isFinite(delta)) return {{ bg: 'rgba(140,140,140,.18)', fg: '#111111' }};
       var x = clamp(delta / absMax, -1, 1);
-      var strength = Math.abs(x);
-      // x > 0 => teacher win (red), x < 0 => student win (green)
+      var st = Math.abs(x);
       if (x >= 0) {{
-        var r = 255;
-        var g = Math.round(255 - 120 * strength);
-        var b = Math.round(255 - 120 * strength);
-        return {{
-          bg: 'rgb(' + r + ',' + g + ',' + b + ')',
-          fg: '#111111'
-        }};
+        return {{ bg: 'rgb(255,' + Math.round(255-120*st) + ',' + Math.round(255-120*st) + ')', fg: '#111111' }};
       }}
-      var r2 = Math.round(255 - 120 * strength);
-      var g2 = 255;
-      var b2 = Math.round(255 - 120 * strength);
-      return {{
-        bg: 'rgb(' + r2 + ',' + g2 + ',' + b2 + ')',
-        fg: '#111111'
-      }};
+      return {{ bg: 'rgb(' + Math.round(255-120*st) + ',255,' + Math.round(255-120*st) + ')', fg: '#111111' }};
     }}
 
+    /* ── Overview stats ── */
     function summarizeOverviewStats() {{
-      var nRecords = Z.length;
+      var nRecords = (allHeatmapRows.length > 0) ? allHeatmapRows[0].length : 0;
       var rewardCounts = {{}};
       rewards.forEach(function(r) {{
         var k = (r === null || r === undefined) ? '?' : String(r);
         rewardCounts[k] = (rewardCounts[k] || 0) + 1;
       }});
       var rewardStr = Object.entries(rewardCounts)
-        .map(function(e) {{ return 'reward=' + e[0] + ': ' + e[1]; }})
-        .join(' | ');
+        .map(function(e) {{ return 'reward=' + e[0] + ': ' + e[1]; }}).join(' | ');
 
+      // Use first teacher's rows for aggregate stats
+      var Z0 = allHeatmapRows.length > 0 ? allHeatmapRows[0] : [];
       var totalTokens = 0, teacherWins = 0, deltaSum = 0;
-      Z.forEach(function(row) {{
+      Z0.forEach(function(row) {{
         row.forEach(function(v) {{
           if (v !== null && v !== undefined && isFinite(v)) {{
-            totalTokens++;
-            deltaSum += v;
+            totalTokens++; deltaSum += v;
             if (v > 0) teacherWins++;
           }}
         }});
@@ -1073,10 +1144,11 @@ def generate_html(
         nRecords + ' requests  |  ' + rewardStr +
         '  |  max token position shown: ' + {max_tokens} +
         '  |  window: ' + escHtml(windowDesc) +
-        '<br><strong>Teacher win rate:</strong> ' + teacherWinRate + '%  |  ' +
-        '<strong>Mean Δ (teacher − student):</strong> ' + meanDelta;
+        '<br><strong>Teacher[0] win rate:</strong> ' + teacherWinRate + '%  |  ' +
+        '<strong>Teacher[0] Mean Δ:</strong> ' + meanDelta;
     }}
 
+    /* ── Boxed summary ── */
     function renderBoxedSummary() {{
       var boxedEl = document.getElementById('boxed-summary');
       if (!boxedStats || !boxedStats.available) {{
@@ -1085,67 +1157,127 @@ def generate_html(
           escHtml((boxedStats && boxedStats.reason) ? boxedStats.reason : 'Not available.');
         return;
       }}
-      var a1 = boxedStats.all_boxed.reward_1;
-      var a0 = boxedStats.all_boxed.reward_0;
-      var l1 = boxedStats.last_boxed_only.reward_1;
-      var l0 = boxedStats.last_boxed_only.reward_0;
+      var a1=boxedStats.all_boxed.reward_1, a0=boxedStats.all_boxed.reward_0;
+      var l1=boxedStats.last_boxed_only.reward_1, l0=boxedStats.last_boxed_only.reward_0;
       boxedEl.innerHTML =
-        '<strong>Boxed Token Stats (teacher − student)</strong><br>' +
-        'Eligible records: ' + boxedStats.eligible_records +
-        ' | Missing \\\\boxed records: ' + boxedStats.missing_boxed_records +
-        ' | NaN filtered (all/last): ' + boxedStats.nan_tokens_all_boxed + '/' + boxedStats.nan_tokens_last_boxed +
-        '<table class="boxed-table">' +
-          '<thead><tr><th>Region</th><th>Reward</th><th>Samples</th><th>Tokens</th><th>Pooled Mean Δ</th><th>Sample Mean Δ</th></tr></thead>' +
-          '<tbody>' +
-            '<tr><td>All boxed spans</td><td>1</td><td>' + a1.sample_count + '</td><td>' + a1.token_count + '</td><td>' + fmtNum(a1.pooled_mean_delta) + '</td><td>' + fmtNum(a1.sample_mean_delta) + '</td></tr>' +
-            '<tr><td>All boxed spans</td><td>0</td><td>' + a0.sample_count + '</td><td>' + a0.token_count + '</td><td>' + fmtNum(a0.pooled_mean_delta) + '</td><td>' + fmtNum(a0.sample_mean_delta) + '</td></tr>' +
-            '<tr><td>Last boxed only</td><td>1</td><td>' + l1.sample_count + '</td><td>' + l1.token_count + '</td><td>' + fmtNum(l1.pooled_mean_delta) + '</td><td>' + fmtNum(l1.sample_mean_delta) + '</td></tr>' +
-            '<tr><td>Last boxed only</td><td>0</td><td>' + l0.sample_count + '</td><td>' + l0.token_count + '</td><td>' + fmtNum(l0.pooled_mean_delta) + '</td><td>' + fmtNum(l0.sample_mean_delta) + '</td></tr>' +
-          '</tbody>' +
-        '</table>';
+        '<strong>Boxed Token Stats — Teacher[0] vs Student</strong><br>' +
+        'Eligible: ' + boxedStats.eligible_records +
+        ' | Missing \\\\boxed: ' + boxedStats.missing_boxed_records +
+        ' | NaN (all/last): ' + boxedStats.nan_tokens_all_boxed + '/' + boxedStats.nan_tokens_last_boxed +
+        '<table class="boxed-table"><thead><tr><th>Region</th><th>Reward</th><th>Samples</th><th>Tokens</th><th>Pooled Mean Δ</th><th>Sample Mean Δ</th></tr></thead><tbody>' +
+        '<tr><td>All boxed</td><td>1</td><td>' + a1.sample_count + '</td><td>' + a1.token_count + '</td><td>' + fmtNum(a1.pooled_mean_delta) + '</td><td>' + fmtNum(a1.sample_mean_delta) + '</td></tr>' +
+        '<tr><td>All boxed</td><td>0</td><td>' + a0.sample_count + '</td><td>' + a0.token_count + '</td><td>' + fmtNum(a0.pooled_mean_delta) + '</td><td>' + fmtNum(a0.sample_mean_delta) + '</td></tr>' +
+        '<tr><td>Last boxed</td><td>1</td><td>' + l1.sample_count + '</td><td>' + l1.token_count + '</td><td>' + fmtNum(l1.pooled_mean_delta) + '</td><td>' + fmtNum(l1.sample_mean_delta) + '</td></tr>' +
+        '<tr><td>Last boxed</td><td>0</td><td>' + l0.sample_count + '</td><td>' + l0.token_count + '</td><td>' + fmtNum(l0.pooled_mean_delta) + '</td><td>' + fmtNum(l0.sample_mean_delta) + '</td></tr>' +
+        '</tbody></table>';
     }}
 
-    function renderOverviewHeatmap() {{
-      var trace = {{
-        type: 'heatmap',
-        z: Z,
-        x: xCenters,
-        y: yLabels,
-        customdata: tokenRows,
-        colorscale: colorscale,
-        zmin: -absMax,
-        zmax: absMax,
-        zmid: 0,
-        colorbar: {{
-          title: {{ text: 'teacher − student<br>logprob', side: 'right' }},
-          thickness: 14,
-          len: 0.55,
-          tickfont: {{ size: 10 }},
-        }},
-        hoverongaps: false,
-        hovertemplate:
-          '<b>%{{y}}</b><br>' +
-          'token pos ≈ %{{x}}<br>' +
-          'token: %{{customdata}}<br>' +
-          'Δ logprob: %{{z:.4f}}<extra></extra>',
-      }};
-      var layout = {{
-        margin: {{ l: 150, r: 85, t: 14, b: 56 }},
-        xaxis: {{ title: 'token position', tickfont: {{ size: 10 }} }},
-        yaxis: {{ autorange: 'reversed', tickfont: {{ size: 10 }}, automargin: true }},
-        plot_bgcolor: '#fafbfc',
-      }};
-      Plotly.newPlot('heatmap', [trace], layout, {{ responsive: true, displayModeBar: true }});
+    /* ── Overview: one heatmap per teacher ── */
+    function renderOverviewHeatmaps() {{
+      var container = document.getElementById('heatmap-container');
+      teacherConfigs.forEach(function(tc, ti) {{
+        var color = TEACHER_COLORS[ti % TEACHER_COLORS.length];
+        var wrapper = document.createElement('div');
+        wrapper.style.marginTop = '12px';
 
-      document.getElementById('heatmap').on('plotly_click', function(evt) {{
-        var pt = evt.points[0];
-        var rowIdx = Array.isArray(pt.pointIndex) ? pt.pointIndex[0] : pt.pointIndex;
-        if (rowIdx >= 0 && rowIdx < details.length) {{
-          location.hash = '#req-' + encodeURIComponent(String(details[rowIdx].idx));
-        }}
+        var titleEl = document.createElement('div');
+        titleEl.className = 'section-subtitle';
+        titleEl.innerHTML = 'Teacher ' + ti + ': <span style="color:' + color + ';">' + escHtml(tc.label) + '</span>';
+        wrapper.appendChild(titleEl);
+
+        var chartDiv = document.createElement('div');
+        chartDiv.id = 'heatmap-' + ti;
+        chartDiv.style.cssText = 'width:100%; height:{heatmap_height}px;';
+        wrapper.appendChild(chartDiv);
+        container.appendChild(wrapper);
+
+        var rows = allHeatmapRows[ti] || [];
+        var trace = {{
+          type: 'heatmap',
+          z: rows,
+          x: xCenters,
+          y: yLabels,
+          customdata: tokenRows,
+          colorscale: colorscale,
+          zmin: -absMax, zmax: absMax, zmid: 0,
+          colorbar: {{
+            title: {{ text: 'teacher\u2212student<br>logprob', side: 'right' }},
+            thickness: 14, len: 0.55, tickfont: {{ size: 10 }},
+          }},
+          hoverongaps: false,
+          hovertemplate: '<b>%{{y}}</b><br>token pos \u2248 %{{x}}<br>token: %{{customdata}}<br>\u0394 logprob: %{{z:.4f}}<extra></extra>',
+        }};
+        var layout = {{
+          margin: {{ l: 150, r: 85, t: 14, b: 56 }},
+          xaxis: {{ title: 'token position', tickfont: {{ size: 10 }} }},
+          yaxis: {{ autorange: 'reversed', tickfont: {{ size: 10 }}, automargin: true }},
+          plot_bgcolor: '#fafbfc',
+        }};
+        Plotly.newPlot('heatmap-' + ti, [trace], layout, {{ responsive: true, displayModeBar: true }});
+
+        (function(capturedTi) {{
+          document.getElementById('heatmap-' + capturedTi).on('plotly_click', function(evt) {{
+            var pt = evt.points[0];
+            var rowIdx = Array.isArray(pt.pointIndex) ? pt.pointIndex[0] : pt.pointIndex;
+            if (rowIdx >= 0 && rowIdx < details.length) {{
+              location.hash = '#req-' + encodeURIComponent(String(details[rowIdx].idx));
+            }}
+          }});
+        }})(ti);
       }});
     }}
 
+    /* ── Detail summary metrics ── */
+    function renderDetailSummaryMetrics(d) {{
+      var baseHtml = '';
+      var baseCards = [
+        ['Request', String(d.idx)],
+        ['Reward', String(d.r_str)],
+        ['Token Window', d.window_start_1idx + '\u2026' + d.window_end_1idx + ' / ' + d.n_full],
+      ];
+      baseCards.forEach(function(item) {{
+        baseHtml += '<div class="metric"><div class="label">' + escHtml(item[0]) +
+          '</div><div class="value">' + escHtml(item[1]) + '</div></div>';
+      }});
+      document.getElementById('detail-summary-base').innerHTML = baseHtml;
+
+      var teachers = d.teachers || [];
+      var tHtml = '';
+      teachers.forEach(function(teacher, ti) {{
+        var color = TEACHER_COLORS[ti % TEACHER_COLORS.length];
+        tHtml += '<div class="metric" style="border-left:3px solid ' + color + ';">' +
+          '<div class="label">' + escHtml(teacher.label) + '</div>' +
+          '<div class="value">Win ' + fmtNum(teacher.teacher_win_rate_pct, 1) + '%' +
+          ' &nbsp;|&nbsp; Mean\u0394 ' + fmtNum(teacher.mean_delta, 4) + '</div></div>';
+      }});
+      document.getElementById('detail-summary-teachers').innerHTML = tHtml;
+    }}
+
+    /* ── Delta selector bar ── */
+    function buildDeltaSelectorBar(teachers) {{
+      var bar = document.getElementById('delta-selector-bar');
+      if (!teachers || teachers.length <= 1) {{ bar.innerHTML = ''; return; }}
+      var html = '<div class="delta-selector"><span>Delta bars for teacher:</span>';
+      teachers.forEach(function(teacher, ti) {{
+        var color = TEACHER_COLORS[ti % TEACHER_COLORS.length];
+        var isActive = (ti === currentDetailTeacherIdx);
+        var activeStyle = isActive
+          ? 'background:' + color + ';border-color:' + color + ';'
+          : '';
+        html += '<button class="delta-btn' + (isActive ? ' active' : '') + '" data-ti="' + ti + '" style="' + activeStyle + '">' +
+          escHtml(teacher.label) + '</button>';
+      }});
+      html += '</div>';
+      bar.innerHTML = html;
+      bar.querySelectorAll('.delta-btn').forEach(function(btn) {{
+        btn.addEventListener('click', function() {{
+          currentDetailTeacherIdx = Number(btn.dataset.ti);
+          if (currentRowIdx !== null) renderQuestionDetail(currentRowIdx);
+        }});
+      }});
+    }}
+
+    /* ── Detail view ── */
     function renderQuestionDetail(rowIdx) {{
       if (rowIdx < 0 || rowIdx >= details.length) return;
       currentRowIdx = rowIdx;
@@ -1154,85 +1286,94 @@ def generate_html(
       while (tokens.length < d.n) tokens.push('');
       var shownTokens = tokens.map(visibleToken);
       var xAbs = windowAbsoluteX(d);
+
       var selectEl = document.getElementById('req-select');
-      if (selectEl.selectedIndex !== rowIdx) {{
-        selectEl.selectedIndex = rowIdx;
-      }}
+      if (selectEl.selectedIndex !== rowIdx) selectEl.selectedIndex = rowIdx;
 
       document.getElementById('overview-section').style.display = 'none';
       document.getElementById('detail-page').style.display = 'block';
       document.getElementById('detail-title').textContent =
         'Request ' + d.idx + ' | reward=' + d.r_str +
-        ' | token window ' + d.window_start_1idx + '...' + d.window_end_1idx + ' / ' + d.n_full;
+        ' | tokens ' + d.window_start_1idx + '\u2026' + d.window_end_1idx + ' / ' + d.n_full;
 
-      var summaryHtml = '';
-      var cards = [
-        ['Request', String(d.idx)],
-        ['Reward', String(d.r_str)],
-        ['Token Window', d.window_start_1idx + '...' + d.window_end_1idx],
-        ['Teacher Win Rate', fmtNum(d.teacher_win_rate_pct, 1) + (isFinite(d.teacher_win_rate_pct) ? '%' : '')],
-        ['Mean Δ', fmtNum(d.mean_delta, 5)]
-      ];
-      cards.forEach(function(item) {{
-        summaryHtml +=
-          '<div class="metric"><div class="label">' + escHtml(item[0]) +
-          '</div><div class="value">' + escHtml(item[1]) + '</div></div>';
+      renderDetailSummaryMetrics(d);
+      document.getElementById('question-text').textContent = String(d.question_text || '(unavailable)');
+
+      /* Multi-teacher token wall */
+      var teachers = d.teachers && d.teachers.length > 0
+        ? d.teachers
+        : [{{ label: 'teacher', logprobs: d.teacher_logprobs, delta: d.delta,
+              teacher_win_rate_pct: d.teacher_win_rate_pct, mean_delta: d.mean_delta }}];
+
+      var wallHtml = '';
+      teachers.forEach(function(teacher, ti) {{
+        var color = TEACHER_COLORS[ti % TEACHER_COLORS.length];
+        wallHtml += '<div class="teacher-wall-section">';
+        wallHtml += '<div class="teacher-wall-label" style="border-left-color:' + color + ';">' +
+          escHtml(teacher.label) + '</div>';
+        wallHtml += '<div class="teacher-chips-row">';
+        var chips = [];
+        for (var ci = 0; ci < shownTokens.length; ci++) {{
+          var dv = (teacher.delta && ci < teacher.delta.length) ? teacher.delta[ci] : NaN;
+          var cs = deltaToChipStyle(dv);
+          var absPos = xAbs[ci];
+          var tlp = (teacher.logprobs && ci < teacher.logprobs.length) ? teacher.logprobs[ci] : NaN;
+          var slp = (d.student_logprobs && ci < d.student_logprobs.length) ? d.student_logprobs[ci] : NaN;
+          var tip = 'pos=' + absPos + '\\ntoken=' + shownTokens[ci] +
+            '\\n\u0394=' + fmtNum(dv, 5) + '\\nteacher=' + fmtNum(tlp, 5) + '\\nstudent=' + fmtNum(slp, 5);
+          chips.push(
+            '<span class="token-chip" title="' + escHtml(tip) +
+            '" style="background:' + cs.bg + ';color:' + cs.fg + ';">' +
+            '<span class="token-text">' + escHtml(shownTokens[ci]) + '</span></span>'
+          );
+        }}
+        wallHtml += chips.join('') + '</div></div>';
       }});
-      document.getElementById('detail-summary').innerHTML = summaryHtml;
+      document.getElementById('multi-teacher-wall').innerHTML = wallHtml;
 
-      document.getElementById('question-text').textContent = String(d.question_text || '(Question text unavailable)');
+      /* Delta selector & chart */
+      buildDeltaSelectorBar(teachers);
+      var selIdx = Math.min(currentDetailTeacherIdx, teachers.length - 1);
+      var selTeacher = teachers[selIdx];
 
-      var wall = document.getElementById('token-wall');
-      var chips = [];
-      for (var ti = 0; ti < shownTokens.length; ti++) {{
-        var style = deltaToChipStyle(d.delta[ti]);
-        var absPos = xAbs[ti];
-        var tip =
-          'pos=' + absPos +
-          '\\ntoken=' + shownTokens[ti] +
-          '\\nΔ=' + fmtNum(d.delta[ti], 5) +
-          '\\nteacher=' + fmtNum(d.teacher_logprobs[ti], 5) +
-          '\\nstudent=' + fmtNum(d.student_logprobs[ti], 5);
-        chips.push(
-          '<span class="token-chip" title="' + escHtml(tip) + '" style="background:' + style.bg + ';color:' + style.fg + ';">' +
-            '<span class="token-pos">[' + absPos + ']</span>' +
-            '<span class="token-text">' + escHtml(shownTokens[ti]) + '</span>' +
-          '</span>'
-        );
+      var traces = [];
+      /* Student logprob line */
+      traces.push({{
+        type: 'scatter', mode: 'lines+markers',
+        x: xAbs, y: d.student_logprobs, customdata: shownTokens,
+        name: 'student',
+        line: {{ color: '#2f5a9b', width: 1.5 }}, marker: {{ size: 3, color: '#2f5a9b' }},
+        hovertemplate: 'pos=%{{x}}<br>tok=%{{customdata}}<br>student=%{{y:.5f}}<extra>student</extra>',
+      }});
+      /* Teacher logprob lines */
+      teachers.forEach(function(teacher, ti) {{
+        var tcolor = TEACHER_COLORS[ti % TEACHER_COLORS.length];
+        traces.push({{
+          type: 'scatter', mode: 'lines+markers',
+          x: xAbs, y: teacher.logprobs, customdata: shownTokens,
+          name: teacher.label,
+          line: {{ color: tcolor, width: 1.5 }}, marker: {{ size: 3, color: tcolor }},
+          hovertemplate: 'pos=%{{x}}<br>tok=%{{customdata}}<br>' + escHtml(teacher.label) + '=%{{y:.5f}}<extra>' + escHtml(teacher.label) + '</extra>',
+        }});
+      }});
+      /* Delta bars for selected teacher */
+      if (selTeacher && selTeacher.delta) {{
+        traces.push({{
+          type: 'bar', yaxis: 'y2', x: xAbs,
+          y: selTeacher.delta.map(function(v) {{ return isFinite(v) ? v : 0; }}),
+          customdata: shownTokens,
+          name: '\u0394 ' + selTeacher.label,
+          marker: {{
+            color: selTeacher.delta.map(function(v) {{
+              if (!isFinite(v)) return 'rgba(140,140,140,.30)';
+              return v > 0 ? 'rgba(139,0,0,.35)' : 'rgba(26,122,26,.35)';
+            }}),
+          }},
+          hovertemplate: 'pos=%{{x}}<br>tok=%{{customdata}}<br>\u0394=%{{y:.5f}}<extra>\u0394 ' + escHtml(selTeacher.label) + '</extra>',
+        }});
       }}
-      wall.innerHTML = chips.join('');
 
-      var lineCustom = shownTokens;
-      var teacherTrace = {{
-        type: 'scatter', mode: 'lines+markers',
-        x: xAbs, y: d.teacher_logprobs, customdata: lineCustom,
-        name: 'teacher logprob',
-        line: {{ color: '#d17a20', width: 1.5 }},
-        marker: {{ size: 3, color: '#d17a20' }},
-        hovertemplate: 'pos=%{{x}}<br>token=%{{customdata}}<br>teacher=%{{y:.5f}}<extra>teacher</extra>',
-      }};
-      var studentTrace = {{
-        type: 'scatter', mode: 'lines+markers',
-        x: xAbs, y: d.student_logprobs, customdata: lineCustom,
-        name: 'student logprob',
-        line: {{ color: '#2f5a9b', width: 1.5 }},
-        marker: {{ size: 3, color: '#2f5a9b' }},
-        hovertemplate: 'pos=%{{x}}<br>token=%{{customdata}}<br>student=%{{y:.5f}}<extra>student</extra>',
-      }};
-      var deltaBar = {{
-        type: 'bar', yaxis: 'y2', x: xAbs,
-        y: d.delta.map(function(v) {{ return isFinite(v) ? v : 0; }}),
-        customdata: lineCustom,
-        name: 'Δ (teacher−student)',
-        marker: {{
-          color: d.delta.map(function(v) {{
-            if (!isFinite(v)) return 'rgba(140,140,140,0.30)';
-            return v > 0 ? 'rgba(139,0,0,0.35)' : 'rgba(26,122,26,0.35)';
-          }}),
-        }},
-        hovertemplate: 'pos=%{{x}}<br>token=%{{customdata}}<br>Δ=%{{y:.5f}}<extra>Δ</extra>',
-      }};
-
+      /* Shapes / annotations (think/answer markers) */
       var shapes = [], annotations = [];
       var thinkStartAbs = toAbsPosition(d.thinking_token_start, d.window_start_1idx);
       var thinkEndAbs = toAbsPosition(d.thinking_token_end, d.window_start_1idx);
@@ -1255,30 +1396,26 @@ def generate_html(
         annotations.push({{ x:ansAbs, y:0.86, yref:'paper', text:'answer', showarrow:false,
           font:{{ color:'#d62728', size:10 }}, xanchor:'left' }});
       }}
+
       var layout2 = {{
-        title: {{ text: 'Per-token logprob curves for request ' + d.idx, font: {{ size: 13 }} }},
+        title: {{ text: 'Per-token logprobs · request ' + d.idx + ' · delta = ' + escHtml(selTeacher ? selTeacher.label : ''), font: {{ size: 12 }} }},
         xaxis: {{ title: 'token position (absolute)', tickfont: {{ size: 10 }} }},
         yaxis: {{ title: 'logprob', tickfont: {{ size: 10 }} }},
-        yaxis2: {{
-          title: 'Δ logprob', overlaying: 'y', side: 'right',
-          zeroline: true, zerolinecolor: '#a3acba', tickfont: {{ size: 10 }},
-        }},
+        yaxis2: {{ title: '\u0394 logprob', overlaying: 'y', side: 'right',
+          zeroline: true, zerolinecolor: '#a3acba', tickfont: {{ size: 10 }} }},
         hovermode: 'x unified',
         legend: {{ orientation: 'h', y: -0.18, font: {{ size: 10 }} }},
         margin: {{ l: 58, r: 66, t: 52, b: 78 }},
-        shapes: shapes,
-        annotations: annotations,
-        plot_bgcolor: '#fafbfc',
-        bargap: 0,
+        shapes: shapes, annotations: annotations,
+        plot_bgcolor: '#fafbfc', bargap: 0,
       }};
-      Plotly.react('detail-chart', [teacherTrace, studentTrace, deltaBar], layout2, {{ responsive: true }});
+      Plotly.react('detail-chart', traces, layout2, {{ responsive: true }});
 
+      /* Token preview text */
       var previewLimit = 450;
-      var preview = shownTokens.slice(0, previewLimit).map(function(tok, i) {{
-        return '[' + xAbs[i] + '] ' + tok;
-      }}).join(' ');
+      var preview = shownTokens.slice(0, previewLimit).join(' ');
       if (shownTokens.length > previewLimit) {{
-        preview += '\\n... (' + (shownTokens.length - previewLimit) + ' more tokens hidden in preview)';
+        preview += '\\n... (' + (shownTokens.length - previewLimit) + ' more tokens)';
       }}
       document.getElementById('token-preview').textContent = preview;
 
@@ -1287,6 +1424,7 @@ def generate_html(
       document.getElementById('detail-page').scrollIntoView({{ behavior: 'smooth', block: 'start' }});
     }}
 
+    /* ── Navigator ── */
     function bindNavigator() {{
       var selectEl = document.getElementById('req-select');
       details.forEach(function(d, i) {{
@@ -1295,26 +1433,20 @@ def generate_html(
         option.textContent = 'req ' + d.idx + ' | reward=' + d.r_str;
         selectEl.appendChild(option);
       }});
-
       document.getElementById('nav-prev').addEventListener('click', function() {{
         if (currentRowIdx === null) return;
-        var next = Math.max(0, currentRowIdx - 1);
-        location.hash = '#req-' + encodeURIComponent(String(details[next].idx));
+        location.hash = '#req-' + encodeURIComponent(String(details[Math.max(0, currentRowIdx-1)].idx));
       }});
-
       document.getElementById('nav-next').addEventListener('click', function() {{
         if (currentRowIdx === null) return;
-        var next = Math.min(details.length - 1, currentRowIdx + 1);
-        location.hash = '#req-' + encodeURIComponent(String(details[next].idx));
+        location.hash = '#req-' + encodeURIComponent(String(details[Math.min(details.length-1, currentRowIdx+1)].idx));
       }});
-
       selectEl.addEventListener('change', function(evt) {{
         var targetRow = Number(evt.target.value);
         if (isFinite(targetRow) && targetRow >= 0 && targetRow < details.length) {{
           location.hash = '#req-' + encodeURIComponent(String(details[targetRow].idx));
         }}
       }});
-
       document.getElementById('back-overview').addEventListener('click', function() {{
         history.replaceState(null, '', location.pathname + location.search);
         currentRowIdx = null;
@@ -1347,14 +1479,12 @@ def generate_html(
       if (!m) return;
       var reqId = decodeURIComponent(m[1] || '');
       var rowIdx = findRowIndexByReqId(reqId);
-      if (rowIdx >= 0) {{
-        renderQuestionDetail(rowIdx);
-      }}
+      if (rowIdx >= 0) renderQuestionDetail(rowIdx);
     }}
 
     summarizeOverviewStats();
     renderBoxedSummary();
-    renderOverviewHeatmap();
+    renderOverviewHeatmaps();
     bindNavigator();
     syncHashRoute();
     window.addEventListener('hashchange', syncHashRoute);
@@ -1459,7 +1589,7 @@ def main():
             print(f"WARNING: failed to load tokenizer from {args.tokenizer}: {e}")
             print("Will fall back to best-effort whitespace token chunks.")
 
-    heatmap_rows, row_labels, rewards, x_positions, detail_data, max_tokens, token_rows, window_desc = build_heatmap_data(
+    data = build_heatmap_data(
         records,
         tokenizer=tokenizer,
         n_bins=args.n_bins,
@@ -1467,19 +1597,21 @@ def main():
         last_k_tokens=args.show_last_k_tokens,
     )
 
-    if not heatmap_rows:
-        print("No records with both student_logprobs and teacher_logprobs found. Nothing to plot.")
+    if not data["detail_data"]:
+        print("No records with valid student_logprobs and teacher_logprobs found. Nothing to plot.")
         return
+
+    n_teachers = len(data["teacher_configs"])
+    n_records = len(data["row_labels"])
+    print(
+        f"Building heatmap: {n_records} requests × {data['max_tokens']} tokens × {n_teachers} teacher(s): "
+        + ", ".join(tc["label"] for tc in data["teacher_configs"])
+    )
 
     boxed_stats = compute_boxed_stats(records, tokenizer=tokenizer)
 
-    print(f"Building heatmap: {len(heatmap_rows)} rows x {max_tokens} tokens | max_tokens={max_tokens}")
-
     plotly_js_src = _get_plotly_js()
-    html = generate_html(
-        heatmap_rows, row_labels, rewards, x_positions, detail_data, max_tokens, token_rows, window_desc, boxed_stats,
-        plotly_js_src=plotly_js_src,
-    )
+    html = generate_html(data, boxed_stats, plotly_js_src=plotly_js_src)
 
     out_path = Path(args.output).resolve()
     out_path.parent.mkdir(parents=True, exist_ok=True)

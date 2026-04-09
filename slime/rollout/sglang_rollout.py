@@ -36,6 +36,15 @@ __all__ = ["generate_rollout"]
 logger = logging.getLogger(__name__)
 
 
+def _should_use_custom_rm(args: Namespace, sample: Sample, evaluation: bool) -> bool:
+    # During eval, allow dataset rm_type to bypass custom RM (e.g., OPD teacher calls).
+    if not evaluation or args.custom_rm_path is None:
+        return True
+    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    rm_type = (metadata.get("rm_type") or args.rm_type or "").strip()
+    return not bool(rm_type)
+
+
 def _extract_scalar_logprob(value: Any) -> float:
     if isinstance(value, (int, float)):
         return float(value)
@@ -351,16 +360,33 @@ async def generate_and_rm(
 
         # for multi agent system, the reward of some sample is calculated during generation.
         samples_need_reward = [sample for sample in samples if sample.reward is None]
-        rewards = await batched_async_rm(args, samples_need_reward)
-        for sample, reward in zip(samples_need_reward, rewards, strict=False):
-            sample.reward = reward
+        if samples_need_reward:
+            if evaluation and args.custom_rm_path is not None:
+                # Eval can contain mixed rm_type settings; compute per-sample to choose RM path precisely.
+                tasks = [
+                    async_rm(
+                        args,
+                        sample,
+                        use_custom_rm=_should_use_custom_rm(args, sample, evaluation=True),
+                    )
+                    for sample in samples_need_reward
+                ]
+                rewards = await asyncio.gather(*tasks)
+            else:
+                rewards = await batched_async_rm(args, samples_need_reward)
+            for sample, reward in zip(samples_need_reward, rewards, strict=False):
+                sample.reward = reward
         return samples
     else:
         if sample.status == Sample.Status.ABORTED:
             return sample
         # for multi-turn environment, a reward could be assigned to the agent.
         if sample.reward is None:
-            sample.reward = await async_rm(args, sample)
+            sample.reward = await async_rm(
+                args,
+                sample,
+                use_custom_rm=_should_use_custom_rm(args, sample, evaluation=evaluation),
+            )
 
     return sample
 
@@ -653,9 +679,16 @@ async def eval_rollout_single_dataset(
     data.sort(key=lambda sample: sample.index)
 
     reward_key = args.eval_reward_key or args.reward_key
+
+    def get_eval_reward(sample: Sample):
+        reward = sample.reward
+        if reward_key and isinstance(reward, dict):
+            return reward[reward_key]
+        return reward
+
     return {
         dataset_cfg.name: {
-            "rewards": [sample.reward if not reward_key else sample.reward[reward_key] for sample in data],
+            "rewards": [get_eval_reward(sample) for sample in data],
             "truncated": [sample.status == Sample.Status.TRUNCATED for sample in data],
             "samples": data,
             "n_samples_per_eval_prompt": dataset_cfg.n_samples_per_eval_prompt,

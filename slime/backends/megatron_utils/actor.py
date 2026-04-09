@@ -228,7 +228,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
             rollout_data["max_seq_lens"] = [max_seq_len] * len(rollout_data["tokens"])
 
-        for key in ["rollout_log_probs", "teacher_log_probs"]:
+        for key in ["rollout_log_probs", "teacher_log_probs", "teacher_logprob_mask"]:
             if key not in rollout_data:
                 continue
             rollout_data[key] = [
@@ -241,7 +241,7 @@ class MegatronTrainRayActor(TrainRayActor):
                         rollout_data["max_seq_lens"][i] if self.args.qkv_format == "bshd" else None,
                     ),
                     device=torch.cuda.current_device(),
-                    dtype=torch.float32,
+                    dtype=torch.float32 if key != "teacher_logprob_mask" else torch.int,
                 )
                 for i, (log_prob, total_length, response_length) in enumerate(
                     zip(

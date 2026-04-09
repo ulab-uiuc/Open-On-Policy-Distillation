@@ -381,6 +381,28 @@ def apply_opd_kl_to_advantages(
     if student_log_probs is None:
         return
 
+    raw_distill_sample_mask = rollout_data.get("opd_distill_sample_mask")
+    if raw_distill_sample_mask is None:
+        opd_distill_sample_mask = [1.0] * len(advantages)
+    else:
+        if len(raw_distill_sample_mask) != len(advantages):
+            raise ValueError(
+                "opd_distill_sample_mask length mismatch: "
+                f"{len(raw_distill_sample_mask)} vs {len(advantages)}."
+            )
+        opd_distill_sample_mask = []
+        for value in raw_distill_sample_mask:
+            if isinstance(value, torch.Tensor):
+                if value.numel() != 1:
+                    raise ValueError(
+                        "opd_distill_sample_mask tensor entries must be scalar. "
+                        f"Got shape={tuple(value.shape)}."
+                    )
+                value = float(value.item())
+            else:
+                value = float(value)
+            opd_distill_sample_mask.append(1.0 if value > 0 else 0.0)
+
     kl_mode = getattr(args, "opd_kl_mode", "token_reverse_kl")
     device = student_log_probs[0].device
 
@@ -419,6 +441,14 @@ def apply_opd_kl_to_advantages(
         topk_teacher_mass = []
         topk_tail_kl = []
         for i, adv in enumerate(advantages):
+            if opd_distill_sample_mask[i] <= 0:
+                reverse_kl = torch.zeros_like(adv)
+                advantages[i] = adv - args.opd_kl_coef * reverse_kl
+                reverse_kls.append(reverse_kl)
+                topk_student_mass.append(torch.zeros_like(reverse_kl))
+                topk_teacher_mass.append(torch.zeros_like(reverse_kl))
+                topk_tail_kl.append(torch.zeros_like(reverse_kl))
+                continue
             if student_topk[i].dim() != 2 or teacher_topk[i].dim() != 2:
                 raise ValueError(
                     "OPD top-k tensors must be rank-2 [response_len, k]. "
@@ -444,8 +474,15 @@ def apply_opd_kl_to_advantages(
         if teacher_log_probs is None:
             raise ValueError(f"OPD with opd_type='{args.opd_type}' requires teacher_log_probs, but it is missing.")
         teacher_log_probs = [t.to(device=device) for t in teacher_log_probs]
+        teacher_logprob_mask = rollout_data.get("teacher_logprob_mask")
+        if teacher_logprob_mask is not None:
+            teacher_logprob_mask = [m.to(device=device, dtype=torch.float32) for m in teacher_logprob_mask]
         for i, adv in enumerate(advantages):
             reverse_kl = student_log_probs[i] - teacher_log_probs[i]
+            if teacher_logprob_mask is not None:
+                reverse_kl = reverse_kl * teacher_logprob_mask[i]
+            if opd_distill_sample_mask[i] <= 0:
+                reverse_kl = torch.zeros_like(reverse_kl)
             advantages[i] = adv - args.opd_kl_coef * reverse_kl
             reverse_kls.append(reverse_kl)
 
@@ -703,6 +740,35 @@ def policy_loss_function(
     response_lengths = batch["response_lengths"]
     total_lengths = batch["total_lengths"]
     max_seq_lens = batch.get("max_seq_lens", None)
+    opd_distill_sample_mask = None
+    opd_distill_sample_mask_tensor = None
+    if args.use_opd and getattr(args, "opd_type", None) == "sglang":
+        raw_distill_sample_mask = batch.get("opd_distill_sample_mask")
+        if raw_distill_sample_mask is None:
+            opd_distill_sample_mask = [1.0] * len(response_lengths)
+        else:
+            if len(raw_distill_sample_mask) != len(response_lengths):
+                raise ValueError(
+                    "opd_distill_sample_mask length mismatch: "
+                    f"{len(raw_distill_sample_mask)} vs {len(response_lengths)}."
+                )
+            opd_distill_sample_mask = []
+            for value in raw_distill_sample_mask:
+                if isinstance(value, torch.Tensor):
+                    if value.numel() != 1:
+                        raise ValueError(
+                            "opd_distill_sample_mask tensor entries must be scalar. "
+                            f"Got shape={tuple(value.shape)}."
+                        )
+                    value = float(value.item())
+                else:
+                    value = float(value)
+                opd_distill_sample_mask.append(1.0 if value > 0 else 0.0)
+        opd_distill_sample_mask_tensor = torch.tensor(
+            opd_distill_sample_mask,
+            dtype=torch.float32,
+            device=logits.device,
+        )
 
     _, log_probs_and_entropy = get_log_probs_and_entropy(
         logits,
@@ -918,9 +984,53 @@ def policy_loss_function(
                 raise ValueError(
                     "OPD explicit token_reverse_kl requires teacher_log_probs in batch, but it is missing."
                 )
-            teacher_lp = torch.cat(batch["teacher_log_probs"], dim=0)
-            opd_explicit_values = log_probs - teacher_lp
-            opd_explicit_loss = sum_of_sample_mean(opd_explicit_values)
+            teacher_log_probs = batch["teacher_log_probs"]
+            if len(teacher_log_probs) != len(log_probs_list):
+                raise ValueError(
+                    "OPD explicit token_reverse_kl teacher/student sample count mismatch: "
+                    f"{len(teacher_log_probs)} vs {len(log_probs_list)}."
+                )
+
+            teacher_logprob_mask = batch.get("teacher_logprob_mask")
+            if teacher_logprob_mask is not None and len(teacher_logprob_mask) != len(log_probs_list):
+                raise ValueError(
+                    "OPD explicit token_reverse_kl teacher mask sample count mismatch: "
+                    f"{len(teacher_logprob_mask)} vs {len(log_probs_list)}."
+                )
+
+            opd_explicit_values_list = []
+            combined_masks = []
+            for i, (student_lp_i, teacher_lp_i, loss_mask_i) in enumerate(
+                zip(log_probs_list, teacher_log_probs, batch["loss_masks"], strict=False)
+            ):
+                teacher_lp_i = teacher_lp_i.to(device=student_lp_i.device, dtype=student_lp_i.dtype)
+                explicit_i = student_lp_i - teacher_lp_i
+
+                if teacher_logprob_mask is not None:
+                    teacher_mask_i_float = teacher_logprob_mask[i].to(device=student_lp_i.device, dtype=student_lp_i.dtype)
+                    teacher_mask_i_int = teacher_logprob_mask[i].to(device=student_lp_i.device)
+                    explicit_i = explicit_i * teacher_mask_i_float
+                    combined_mask_i = (loss_mask_i.to(device=student_lp_i.device) * teacher_mask_i_int).int()
+                else:
+                    combined_mask_i = loss_mask_i.to(device=student_lp_i.device).int()
+
+                if opd_distill_sample_mask is not None and opd_distill_sample_mask[i] <= 0:
+                    explicit_i = torch.zeros_like(explicit_i)
+                    combined_mask_i = torch.zeros_like(combined_mask_i)
+
+                opd_explicit_values_list.append(explicit_i)
+                combined_masks.append(combined_mask_i)
+
+            opd_explicit_values = torch.cat(opd_explicit_values_list, dim=0)
+            opd_sum_of_sample_mean = get_sum_of_sample_mean(
+                total_lengths,
+                response_lengths,
+                combined_masks,
+                args.calculate_per_token_loss,
+                args.qkv_format,
+                max_seq_lens,
+            )
+            opd_explicit_loss = opd_sum_of_sample_mean(opd_explicit_values)
         elif kl_mode == "full_vocab_topk_reverse_kl":
             if "opd_topk_token_ids" not in batch or "opd_topk_teacher_log_probs" not in batch:
                 raise ValueError(
@@ -940,6 +1050,10 @@ def policy_loss_function(
                 max_seq_lens=max_seq_lens,
             )
             for i, (student_logits_i, _) in enumerate(response_iter):
+                if opd_distill_sample_mask is not None and opd_distill_sample_mask[i] <= 0:
+                    per_sample_kl.append(torch.zeros((student_logits_i.size(0),), dtype=torch.float32, device=student_logits_i.device))
+                    continue
+
                 topk_ids_i = batch["opd_topk_token_ids"][i]
                 teacher_topk_lp_i = batch["opd_topk_teacher_log_probs"][i]
 
@@ -1053,10 +1167,33 @@ def policy_loss_function(
     if args.use_opsm:
         reported_loss["opsm_clipfrac"] = opsm_clipfrac
 
+    if opd_distill_sample_mask_tensor is not None:
+        if opd_distill_sample_mask_tensor.numel() > 0:
+            active_ratio = opd_distill_sample_mask_tensor.mean()
+        else:
+            active_ratio = torch.tensor(1.0, dtype=torch.float32, device=logits.device)
+        reported_loss["opd_distill_active_ratio"] = active_ratio.clone().detach()
+        reported_loss["opd_distill_skip_ratio"] = (1.0 - active_ratio).clone().detach()
+
     # Add OPD metrics if available
     if "opd_reverse_kl" in batch:
         opd_reverse_kl = torch.cat(batch["opd_reverse_kl"], dim=0)
-        reported_loss["opd_reverse_kl"] = sum_of_sample_mean(opd_reverse_kl).clone().detach()
+        if "teacher_logprob_mask" in batch:
+            combined_masks = [
+                (loss_mask.to(device=opd_reverse_kl.device) * teacher_mask.to(device=opd_reverse_kl.device)).int()
+                for loss_mask, teacher_mask in zip(batch["loss_masks"], batch["teacher_logprob_mask"], strict=False)
+            ]
+            opd_sum_of_sample_mean = get_sum_of_sample_mean(
+                batch["total_lengths"],
+                batch["response_lengths"],
+                combined_masks,
+                args.calculate_per_token_loss,
+                args.qkv_format,
+                batch.get("max_seq_lens", None),
+            )
+            reported_loss["opd_reverse_kl"] = opd_sum_of_sample_mean(opd_reverse_kl).clone().detach()
+        else:
+            reported_loss["opd_reverse_kl"] = sum_of_sample_mean(opd_reverse_kl).clone().detach()
     if opd_explicit_loss is not None:
         reported_loss["opd_explicit_loss"] = opd_explicit_loss.clone().detach()
 

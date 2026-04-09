@@ -1016,6 +1016,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--opd-distill-max-response-len",
+                type=int,
+                default=2048,
+                help=(
+                    "Sample-level OPD distillation length gate for --opd-type=sglang. "
+                    "If response_length > this threshold, OPD distillation signals for the "
+                    "entire sample are masked out (both advantage-side KL and explicit OPD loss). "
+                    "Set to -1 to disable gating. Default is 2048."
+                ),
+            )
+            parser.add_argument(
                 "--opd-explicit-loss-coef",
                 type=float,
                 default=0.0,
@@ -1560,6 +1571,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="URL for the reward model service for --rm-type remote_rm, e.g. http://localhost:8000",
             )
             parser.add_argument(
+                "--rm-max-concurrency",
+                type=int,
+                default=8,
+                help=(
+                    "Maximum concurrent outgoing requests to --rm-url in a single rollout process. "
+                    "Used by custom RM paths that make remote HTTP calls (e.g., OPD-SGLang teacher server)."
+                ),
+            )
+            parser.add_argument(
                 "--custom-rm-path",
                 type=str,
                 default=None,
@@ -1884,6 +1904,12 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
 def slime_validate_args(args):
     args.eval_datasets = _resolve_eval_datasets(args)
 
+    if (
+        getattr(args, "opd_distill_max_response_len", -1) != -1
+        and getattr(args, "opd_distill_max_response_len", -1) <= 0
+    ):
+        raise ValueError("--opd-distill-max-response-len must be -1 or a positive integer.")
+
     if args.kl_coef != 0 or args.use_kl_loss:
         if not os.path.exists(args.ref_load):
             raise FileNotFoundError(f"ref_load {args.ref_load} does not exist, please check the path.")
@@ -2015,6 +2041,9 @@ def slime_validate_args(args):
 
     if args.eval_reward_key is None:
         args.eval_reward_key = args.reward_key
+
+    if args.rm_max_concurrency <= 0:
+        raise ValueError("--rm-max-concurrency must be > 0.")
 
     if args.dump_details is not None:
         args.save_debug_rollout_data = f"{args.dump_details}/rollout_data/{{rollout_id}}.pt"

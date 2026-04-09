@@ -4,14 +4,23 @@ Plot token-position OPSD off-policy metrics from
 `eval_student_teacher_inference.py` JSONL output.
 
 Example:
-  python examples/on_policy_distillation/plot_opsd_off_policy_metrics.py \
+python examples/on_policy_distillation/plot_opsd_off_policy_metrics.py \
     --input ./eval_math500_student_teacher_inference_s1.7t1.7b_answeronly_b512.jsonl \
     --segment all \
     --format pdf \
     --max-show-tokens 25000 \
-    --y-min -2 \
-    --y-max 2 \
+    --y-min -1 \
+    --y-max 1 \
     --output-dir ./opsd_offpolicy_plots_s1.7t1.7b_answeronly_b512
+
+python examples/on_policy_distillation/plot_opsd_off_policy_metrics.py \
+    --input eval_math500_student_teacher_inference_s1.7t1.7b_answeronly_disablethinking_b512.jsonl \
+    --segment all \
+    --format pdf \
+    --max-show-tokens 20000 \
+    --y-min -1 \
+    --y-max 1 \
+    --output-dir ./opsd_offpolicy_plots_s1.7t1.7b_answeronly_disablethinking_b512
 """
 
 from __future__ import annotations

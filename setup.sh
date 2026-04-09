@@ -111,11 +111,21 @@ export NCCL_IB_DISABLE=1
 
 CUDA_VISIBLE_DEVICES=3,6,7,8 python3 -m sglang.launch_server --model-path /root/checkpoints_siqi/Qwen3-1.7B --port 30000 --host 0.0.0.0 --tp 1
 
-CUDA_VISIBLE_DEVICES=7 python3 -m sglang.launch_server --model-path /root/checkpoints_siqi/Qwen3-8B --port 30001 --host 0.0.0.0 --tp 1
-CUDA_VISIBLE_DEVICES=9 python3 -m sglang.launch_server --model-path /root/checkpoints_siqi/Qwen3-1.7B --port 30002 --host 0.0.0.0 --tp 1
+CUDA_VISIBLE_DEVICES=7 python3 -m sglang.launch_server --model-path Qwen/Qwen3-8B --port 30001 --host 0.0.0.0 --tp 1
+CUDA_VISIBLE_DEVICES=0,1 python3 -m sglang.launch_server --model-path /root/checkpoints_siqi/Qwen3-1.7B --port 30002 --host 0.0.0.0 --tp 2
+
+CUDA_VISIBLE_DEVICES=4,6 python3 -m sglang.launch_server --model-path Qwen/Qwen2.5-7B-Instruct --port 30002 --host 0.0.0.0 --tp 1
+CUDA_VISIBLE_DEVICES=0,1 python3 -m sglang.launch_server --model-path Qwen/Qwen2.5-7B-Instruct --port 30002 --host 0.0.0.0 --tp 1
+CUDA_VISIBLE_DEVICES=2 python3 -m sglang.launch_server --model-path Qwen/Qwen3-8B --port 30000 --host 0.0.0.0 --tp 1
 
 
-kill -9 $(lsof -t -i :13141)
+CUDA_VISIBLE_DEVICES=5 python3 -m sglang.launch_server --model-path /root/checkpoints_siqi/Qwen3-1.7B --port 30002 --host 0.0.0.0 --tp 1
+CUDA_VISIBLE_DEVICES=4 python3 -m sglang.launch_server --model-path Qwen/Qwen3-8B --port 30001 --host 0.0.0.0 --tp 1
+
+CUDA_VISIBLE_DEVICES=4,5,7,8 python3 -m sglang.launch_server --model-path Qwen/Qwen3-8B --port 30001 --host 0.0.0.0 --tp 4
+
+
+kill -9 $(lsof -t -i :30001)
 
 python examples/on_policy_distillation/plot_token_winner_interactive.py \                                                             
     --input ./eval_math500_student_teacher_inference.jsonl \
@@ -133,6 +143,27 @@ python examples/on_policy_distillation/plot_token_winner_interactive.py \
   --tokenizer Qwen/Qwen3-1.7B \
   --show-last-k-tokens 64
 
+eval_math500_student_teacher_inference_s1.7t8b_same_as_student_b512.jsonl
+
+python examples/on_policy_distillation/plot_token_winner_interactive.py \
+  --input eval_math500_student_teacher_inference_s1.7t1.7b_answeronly_b512.jsonl \
+  --output ./token_winner_interactive.html \
+  --tokenizer Qwen/Qwen3-1.7B \
+  --show-last-k-tokens 128
+
+
+python examples/on_policy_distillation/plot_token_winner_interactive.py \
+  --input eval_math500_student_teacher_inference_s1.7t8b_answeronly_disablethinking_b512.jsonl \
+  --output ./token_winner_interactive.html \
+  --tokenizer Qwen/Qwen3-1.7B \
+  --show-last-k-tokens 64
+
+
+python examples/on_policy_distillation/plot_token_winner_interactive.py \
+  --input eval_math500_student_teacher_inference_s1.7t1.7b_answeronly_disablethinking_b512.jsonl \
+  --output ./token_winner_interactive.html \
+  --tokenizer Qwen/Qwen3-1.7B \
+  --show-last-k-tokens 64
 
 
 python examples/on_policy_distillation/plot_token_winner_interactive.py \

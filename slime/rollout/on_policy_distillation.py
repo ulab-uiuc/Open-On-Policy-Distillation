@@ -1,5 +1,6 @@
 import json
 import logging
+import asyncio
 from functools import lru_cache
 
 import aiohttp
@@ -10,6 +11,20 @@ from slime.utils.processing_utils import load_tokenizer
 from slime.utils.types import Sample
 
 logger = logging.getLogger(__name__)
+_RM_SEMAPHORES: dict[tuple[int, int], asyncio.Semaphore] = {}
+
+
+def _get_rm_semaphore(args) -> asyncio.Semaphore:
+    limit = int(getattr(args, "rm_max_concurrency", 8) or 8)
+    if limit <= 0:
+        limit = 1
+    loop = asyncio.get_running_loop()
+    key = (id(loop), limit)
+    semaphore = _RM_SEMAPHORES.get(key)
+    if semaphore is None:
+        semaphore = asyncio.Semaphore(limit)
+        _RM_SEMAPHORES[key] = semaphore
+    return semaphore
 
 _ANSWER_ONLY_PROMPT = (
     "The correct final answer to this problem is: {answer}\n"
@@ -126,18 +141,37 @@ def _build_teacher_input_ids(args, sample: Sample) -> list[int]:
 
 
 def _extract_scalar_logprob(item) -> float:
+    if item is None:
+        raise ValueError("Logprob item is None.")
     if isinstance(item, (int, float)):
+        return float(item)
+    if isinstance(item, str):
         return float(item)
     if isinstance(item, (list, tuple)):
         if not item:
             raise ValueError("Empty logprob item.")
-        return float(item[0])
+        return _extract_scalar_logprob(item[0])
     if isinstance(item, dict):
         if "logprob" in item:
-            return float(item["logprob"])
+            return _extract_scalar_logprob(item["logprob"])
         if "value" in item:
-            return float(item["value"])
+            return _extract_scalar_logprob(item["value"])
     raise ValueError(f"Unsupported logprob item format: {type(item)}")
+
+
+def _is_missing_logprob_item(item) -> bool:
+    if item is None:
+        return True
+    if isinstance(item, (list, tuple)):
+        if not item:
+            return False
+        return _is_missing_logprob_item(item[0])
+    if isinstance(item, dict):
+        if "logprob" in item:
+            return _is_missing_logprob_item(item.get("logprob"))
+        if "value" in item:
+            return _is_missing_logprob_item(item.get("value"))
+    return False
 
 
 def _slice_response_items(
@@ -167,6 +201,129 @@ def _slice_response_items(
             return list(items[begin:end])
     # Conservative fallback: keep old behavior (tail slice) for robustness.
     return list(items[-response_len:])
+
+
+def _candidate_response_slices(
+    items: list,
+    full_input_len: int,
+    response_start: int,
+    response_len: int,
+) -> list[list]:
+    if response_len <= 0:
+        return [[]]
+
+    candidates: list[list] = []
+
+    def _add(candidate: list | None) -> None:
+        if candidate is None:
+            return
+        candidate = list(candidate)
+        if len(candidate) != response_len:
+            return
+        if candidate not in candidates:
+            candidates.append(candidate)
+
+    _add(_slice_response_items(items, full_input_len, response_start, response_len))
+
+    if len(items) >= response_len:
+        for shift in (-1, 1):
+            begin = response_start + shift
+            end = begin + response_len
+            if begin >= 0 and end <= len(items):
+                _add(items[begin:end])
+        _add(items[-response_len:])
+
+    return candidates
+
+
+def _extract_response_log_probs_with_mask(
+    teacher_output: dict,
+    *,
+    full_input_len: int,
+    response_start: int,
+    response_len: int,
+) -> tuple[list[float], list[int]]:
+    if response_len <= 0:
+        return [], []
+
+    meta_info = teacher_output.get("meta_info", {}) if isinstance(teacher_output, dict) else {}
+    candidate_specs: list[tuple[str, list[list]]] = []
+
+    input_items = meta_info.get("input_token_logprobs")
+    if isinstance(input_items, list):
+        candidate_specs.append(
+            (
+                "meta_info.input_token_logprobs",
+                _candidate_response_slices(input_items, full_input_len, response_start, response_len),
+            )
+        )
+
+    output_items = meta_info.get("output_token_logprobs")
+    if isinstance(output_items, list):
+        candidate_specs.append(
+            (
+                "meta_info.output_token_logprobs",
+                _candidate_response_slices(
+                    output_items,
+                    full_input_len=len(output_items),
+                    response_start=max(len(output_items) - response_len, 0),
+                    response_len=response_len,
+                ),
+            )
+        )
+
+    errors: list[str] = []
+    for source_name, candidates in candidate_specs:
+        for idx, candidate in enumerate(candidates):
+            values: list[float] = []
+            mask: list[int] = []
+            candidate_errors: list[str] = []
+            missing_positions: list[int] = []
+            for pos, item in enumerate(candidate):
+                try:
+                    values.append(_extract_scalar_logprob(item))
+                    mask.append(1)
+                except Exception as exc:
+                    if _is_missing_logprob_item(item):
+                        values.append(0.0)
+                        mask.append(0)
+                        missing_positions.append(pos)
+                        candidate_errors.append(f"pos={pos}: {exc}")
+                    else:
+                        candidate_errors.append(f"pos={pos}: {exc}")
+                        values = []
+                        mask = []
+                        break
+            valid_positions = sum(mask)
+            if values and valid_positions > 0:
+                missing = len(missing_positions)
+                if missing > 0:
+                    preview = missing_positions[:8]
+                    logger.warning(
+                        "Teacher response logprobs contain %s missing positions; they will be masked out. "
+                        "source=%s candidate=%s missing_positions=%s response_len=%s response_start=%s "
+                        "full_input_len=%s",
+                        missing,
+                        source_name,
+                        idx,
+                        preview,
+                        response_len,
+                        response_start,
+                        full_input_len,
+                    )
+                return values, mask
+            if candidate_errors:
+                if values and valid_positions == 0:
+                    candidate_errors.append("all positions are missing")
+                errors.append(f"{source_name}[candidate={idx}]: {'; '.join(candidate_errors[:4])}")
+
+    available_keys = sorted(meta_info.keys()) if isinstance(meta_info, dict) else []
+    raise ValueError(
+        "Failed to extract teacher response logprobs. "
+        f"response_len={response_len}, response_start={response_start}, "
+        f"full_input_len={full_input_len}, available_meta_info_keys={available_keys}, "
+        f"errors={errors[:4]}"
+    )
 
 
 def _extract_id_logprob_map(raw) -> dict[int, float]:
@@ -283,7 +440,14 @@ async def reward_func(args, sample, **kwargs):
             "skip_special_tokens": False,
         },
         "return_logprob": True,
-        "logprob_start_len": response_start if use_topk_kl else 0,
+        # For OPD we only need teacher logprobs on the generated response tokens.
+        # We request from (response_start - 1) rather than response_start because SGLang
+        # always prepends a None to input_token_logprobs_val for the boundary token at
+        # logprob_start_len (it needs the hidden state one position *before* to compute
+        # that token's logprob). By including one extra prompt token, the first response
+        # token's logprob is available and the leading None lands on the last prompt token
+        # instead, which we discard via the tail-slice in _slice_response_items.
+        "logprob_start_len": max(response_start - 1, 0),
     }
     if use_topk_kl:
         topk_token_ids = getattr(sample, "opd_topk_token_ids", None)
@@ -300,10 +464,12 @@ async def reward_func(args, sample, **kwargs):
         payload["token_ids_logprob"] = topk_token_ids
 
     session_kwargs = {}
-    async with aiohttp.ClientSession(**session_kwargs) as session:
-        async with session.post(args.rm_url, json=payload) as resp:
-            resp.raise_for_status()
-            teacher_output = await resp.json()
+    rm_semaphore = _get_rm_semaphore(args)
+    async with rm_semaphore:
+        async with aiohttp.ClientSession(**session_kwargs) as session:
+            async with session.post(args.rm_url, json=payload) as resp:
+                resp.raise_for_status()
+                teacher_output = await resp.json()
 
     teacher_topk_log_probs = None
     if use_topk_kl:
@@ -369,6 +535,15 @@ def post_process_rewards(args, samples: list[Sample], **kwargs):
     reward_key = getattr(args, "reward_key", None) or "accuracy"
     raw_rewards = []
     response_lengths = [sample.response_length for sample in samples]
+    use_opd_sglang = getattr(args, "use_opd", False) and getattr(args, "opd_type", None) == "sglang"
+    opd_distill_max_response_len = int(getattr(args, "opd_distill_max_response_len", 2048))
+
+    if use_opd_sglang:
+        for sample, response_length in zip(samples, response_lengths, strict=False):
+            if opd_distill_max_response_len == -1:
+                sample.opd_distill_sample_mask = 1
+            else:
+                sample.opd_distill_sample_mask = 1 if response_length <= opd_distill_max_response_len else 0
 
     teacher_outputs = []
     teacher_input_lens = []
@@ -395,12 +570,20 @@ def post_process_rewards(args, samples: list[Sample], **kwargs):
 
     # Extract teacher log-probs from the sglang response
     teacher_log_probs = []
-    for reward, response_length, input_len, response_start in zip(
-        teacher_outputs, response_lengths, teacher_input_lens, teacher_response_starts, strict=False
+    for sample, reward, response_length, input_len, response_start in zip(
+        samples, teacher_outputs, response_lengths, teacher_input_lens, teacher_response_starts, strict=False
     ):
-        input_items = reward["meta_info"]["input_token_logprobs"]
-        response_items = _slice_response_items(input_items, input_len, response_start, response_length)
-        teacher_log_probs.append(torch.tensor([_extract_scalar_logprob(x) for x in response_items], dtype=torch.float32))
+        extracted, extracted_mask = _extract_response_log_probs_with_mask(
+            reward,
+            full_input_len=input_len,
+            response_start=response_start,
+            response_len=response_length,
+        )
+        teacher_log_probs.append(torch.tensor(extracted, dtype=torch.float32))
+        if any(x == 0 for x in extracted_mask):
+            sample.teacher_logprob_mask = torch.tensor(extracted_mask, dtype=torch.int)
+        else:
+            sample.teacher_logprob_mask = torch.ones(response_length, dtype=torch.int)
 
     for sample, t_log_probs in zip(samples, teacher_log_probs, strict=False):
         sample.teacher_log_probs = t_log_probs

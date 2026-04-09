@@ -1,0 +1,14 @@
+# Conservative in-training eval config for the qwen2.5-1.5B student + 7B teacher
+# setup. The default eval_config.yaml uses max_response_len: 32768, which can spike
+# SGLang memory during generation. Keep this smaller by default for training stability.
+eval:
+  defaults:
+    max_response_len: 16384
+    top_p: 0.95
+  datasets:
+    - name: math500
+      path: /root/math/data/eval_math500.jsonl
+      rm_type: math
+      n_samples_per_eval_prompt: 1
+      apply_chat_template_kwargs:
+        enable_thinking: false

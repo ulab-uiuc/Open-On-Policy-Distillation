@@ -492,17 +492,31 @@ def extract_answer(passage: str, mode: str = "auto") -> str | None:
     """
     import re
 
+    def _normalize_inline_answer(raw: str) -> str | None:
+        ans = (raw or "").strip().rstrip(".")
+        # Strip special tokens like <|im_end|>, <|endoftext|>, etc.
+        ans = re.sub(r"<\|[^|]*\|>", "", ans).strip().rstrip(".")
+        # Strip outer LaTeX math delimiters: $8$ → 8, $\frac{1}{2}$ → \frac{1}{2}
+        ans = re.sub(r"^\$(.+)\$$", r"\1", ans).strip()
+        # Reject empty/placeholder captures (e.g., "$$" from "Final Answer:" + next-line display math).
+        if not ans:
+            return None
+        compact = re.sub(r"\s+", "", ans)
+        if compact in {"$", "$$"}:
+            return None
+        return ans
+
     if mode in ("answer", "auto"):
-        # "Answer: ..." on its own line (DAPO / Minerva format).
-        match = re.findall(r"(?i)Answer\s*:\s*([^\n]+)", passage)
-        if match:
-            ans = match[-1].strip().rstrip(".")
-            # Strip special tokens like <|im_end|>, <|endoftext|>, etc.
-            ans = re.sub(r"<\|[^|]*\|>", "", ans).strip().rstrip(".")
-            # Strip outer LaTeX math delimiters: $8$ → 8, $\frac{1}{2}$ → \frac{1}{2}
-            ans = re.sub(r"^\$(.+)\$$", r"\1", ans).strip()
-            if ans:
-                return ans
+        # "Answer: ..." on its own line (DAPO / Minerva style), without cross-line capture.
+        # Use [ \t]* around ":" so we don't consume a newline and accidentally capture "$$".
+        matches = re.finditer(r"(?i)Answer[ \t]*:[ \t]*([^\n]*)", passage)
+        valid_answers = []
+        for m in matches:
+            normalized = _normalize_inline_answer(m.group(1))
+            if normalized is not None:
+                valid_answers.append(normalized)
+        if valid_answers:
+            return valid_answers[-1]
 
     if mode in ("boxed", "auto"):
         # LaTeX \boxed{} — explicit boxed format or auto fallback.
