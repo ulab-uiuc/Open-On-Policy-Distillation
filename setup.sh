@@ -220,8 +220,8 @@ CUDA_VISIBLE_DEVICES=1 python3 -m sglang.launch_server --model-path Qwen/Qwen3-8
 cd /root/slime_siqi                                                                                                       
                                                                                                                             
 python3 tools/convert_torch_dist_to_hf.py \
-  --input-dir output/Qwen3-1.7B_sft_openthoughts_math/iter_0000198 \
-  --output-dir /root/checkpoints_siqi/Qwen3-1.7B_openthoughts_sft_step198 \
+  --input-dir output/Qwen3-1.7B_privileged_grpo_full_openthoughts/iter_0000099 \
+  --output-dir /root/checkpoints_siqi/Qwen3-1.7B_privileged_grpo_full_openthoughts_step99 \
   --origin-hf-dir /root/checkpoints_siqi/Qwen3-1.7B
 
 

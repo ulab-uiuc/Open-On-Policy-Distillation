@@ -12,7 +12,7 @@ Output JSONL format matches preprocess_dataset.py:
         "label":    "<boxed answer>",
         "metadata": {
             "raw_problem":          "<original problem text>",
-            "student_user_content": "<same as prompt content>",
+            "student_user_content": "<standard student prompt (no privileged info)>",
             "source":               "<source tag>",
             "reference_solution":   "<full reference solution>",
             "solution":             "<same as reference_solution>",
@@ -20,9 +20,22 @@ Output JSONL format matches preprocess_dataset.py:
         }
     }
 
+When --privileged-mode is set, the ``prompt`` field is replaced with a
+privileged version that embeds extra information (reference solution, answer
+hint, etc.) directly into the user message.  ``metadata.student_user_content``
+always retains the standard (non-privileged) prompt so the reward function can
+still extract the bare problem when needed.
+
+Privileged modes (--privileged-mode):
+  answer_only   : append "The correct final answer is X. Now solve it yourself."
+  full          : prepend full reference solution with transition instruction
+  conciseness   : prepend a conciseness instruction (no ground truth needed)
+
 Usage:
     python filter_openthoughts_math.py --output /root/math/data/train_openthoughts_math.jsonl
     python filter_openthoughts_math.py --output /tmp/out.jsonl --stats-only
+    python filter_openthoughts_math.py --output /root/math/data/train_openthoughts_math_privileged_full.jsonl \\
+        --privileged-mode full
 """
 
 import argparse
@@ -61,6 +74,75 @@ _FORMAT_SUFFIX = {
     ),
     "boxed": "Please reason step by step, and put your final answer within \\boxed{}.",
 }
+
+# ---------------------------------------------------------------------------
+# Privileged prompt builders
+# ---------------------------------------------------------------------------
+
+_ANSWER_ONLY_SUFFIX = (
+    "The correct final answer to this problem is: {answer}\n"
+    "Now solve the problem yourself step by step and arrive at the same answer:"
+)
+
+_FULL_TRANSITION = (
+    "After understanding the reference solution and the rationale behind each step, "
+    "now articulate your own step-by-step reasoning that derives the same final answer "
+    "to the problem above:"
+)
+
+_DEFAULT_CONCISENESS_INSTRUCTION = (
+    "Solve the following math problem concisely and correctly. "
+    "Be direct -- avoid unnecessary elaboration, redundant steps, or restating the problem. "
+    "Focus only on the key reasoning steps needed to reach the answer."
+)
+
+
+def _build_privileged_user_content(
+    mode: str,
+    student_user_content: str,
+    raw_problem: str,
+    label: str,
+    reference_solution: str,
+    format_suffix: str,
+    conciseness_instruction: str = _DEFAULT_CONCISENESS_INSTRUCTION,
+) -> str:
+    """Return the privileged user-message string for the given mode.
+
+    The returned string is used as the ``content`` field of the user message in
+    the ``prompt`` list written to JSONL.  The chat template is applied on top by
+    the Dataset loader, so this should be plain text (no special tokens).
+
+    Args:
+        mode: one of "answer_only", "full", "conciseness".
+        student_user_content: standard (non-privileged) student prompt.
+        raw_problem: bare problem text (no format instruction).
+        label: extracted final answer (e.g. boxed answer string).
+        reference_solution: full reference solution text.
+        format_suffix: format instruction tail (e.g. "Please reason step by step ...").
+        conciseness_instruction: instruction prepended for "conciseness" mode.
+    """
+    if mode == "answer_only":
+        answer_hint = label if label else reference_solution
+        if answer_hint:
+            return f"{student_user_content}\n\n{_ANSWER_ONLY_SUFFIX.format(answer=answer_hint)}"
+        return student_user_content
+
+    if mode == "full":
+        if reference_solution:
+            return (
+                f"{raw_problem}\n\n"
+                f"Here is a reference solution to this problem:\n{reference_solution}\n"
+                f"{_FULL_TRANSITION}\n"
+                f"{format_suffix}"
+            )
+        return student_user_content
+
+    if mode == "conciseness":
+        return f"{conciseness_instruction}\n\n{student_user_content}"
+
+    raise ValueError(
+        f"Unknown --privileged-mode {mode!r}. Choose from: answer_only, full, conciseness."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +191,8 @@ def filter_math(
     answer_format: str = "boxed",
     max_samples: int | None = None,
     stats_only: bool = False,
+    privileged_mode: str | None = None,
+    conciseness_instruction: str = _DEFAULT_CONCISENESS_INSTRUCTION,
 ) -> None:
     try:
         from datasets import load_dataset
@@ -176,8 +260,25 @@ def filter_math(
             student_user_content = fmt_template.format(problem=problem_raw)
             source = _normalize(row.get("source") or row.get("domain") or "openthoughts")
 
+            # Build the prompt content written to JSONL.
+            # In privileged mode the user message already contains the privileged
+            # information; the standard student_user_content is saved separately in
+            # metadata so reward functions can still access the bare problem.
+            if privileged_mode:
+                prompt_user_content = _build_privileged_user_content(
+                    mode=privileged_mode,
+                    student_user_content=student_user_content,
+                    raw_problem=problem_raw,
+                    label=label,
+                    reference_solution=reference_solution,
+                    format_suffix=fmt_suffix,
+                    conciseness_instruction=conciseness_instruction,
+                )
+            else:
+                prompt_user_content = student_user_content
+
             entry = {
-                "prompt": [{"role": "user", "content": student_user_content}],
+                "prompt": [{"role": "user", "content": prompt_user_content}],
                 "label": label,
                 "metadata": {
                     "raw_content": problem_raw,
@@ -247,12 +348,35 @@ def main():
         action="store_true",
         help="Print filter statistics without writing any output file",
     )
+    parser.add_argument(
+        "--privileged-mode",
+        dest="privileged_mode",
+        choices=["answer_only", "full", "conciseness"],
+        default=None,
+        help=(
+            "When set, embed privileged information into the ``prompt`` field so that "
+            "the rollout model generates responses conditioned on the privileged context. "
+            "The standard student prompt is preserved in metadata.student_user_content. "
+            "'answer_only': append 'The correct final answer is X. Now solve it yourself.' "
+            "'full': prepend the complete reference solution with a re-derivation instruction. "
+            "'conciseness': prepend a conciseness instruction (no ground truth required). "
+            "Default: None (standard prompt, no privileged information)."
+        ),
+    )
+    parser.add_argument(
+        "--conciseness-instruction",
+        dest="conciseness_instruction",
+        default=_DEFAULT_CONCISENESS_INSTRUCTION,
+        help="Instruction prepended to the prompt when --privileged-mode=conciseness.",
+    )
     args = parser.parse_args()
     filter_math(
         output=args.output,
         answer_format=args.answer_format,
         max_samples=args.max_samples,
         stats_only=args.stats_only,
+        privileged_mode=args.privileged_mode,
+        conciseness_instruction=args.conciseness_instruction,
     )
 
 

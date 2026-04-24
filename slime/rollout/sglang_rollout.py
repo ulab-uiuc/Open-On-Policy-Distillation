@@ -298,7 +298,10 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
     }
     use_opd_sglang = args.use_opd and getattr(args, "opd_type", None) == "sglang"
     use_topk_kl = use_opd_sglang and getattr(args, "opd_kl_mode", "token_reverse_kl") in (
-        "full_vocab_topk_reverse_kl", "topk_reverse_kl_notail", "topk_reverse_kl_notail_sg"
+        "full_vocab_topk_reverse_kl",
+        "topk_reverse_kl_notail",
+        "topk_reverse_kl_notail_sg",
+        "topk_reverse_kl_intersect_sg_norm",
     )
     diag_enabled = use_opd_sglang and getattr(args, "opd_token_stats", False)
     requested_topk = []

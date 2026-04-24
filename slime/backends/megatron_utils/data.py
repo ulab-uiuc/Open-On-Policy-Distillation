@@ -425,6 +425,7 @@ def log_rollout_data(
                 "teacher_prompt_lengths",
                 # OPD top-k index payload
                 "opd_topk_token_ids",
+                "opd_topk_intersect_mask",
                 "teacher_logprob_mask",
                 # OPD/OPSD token-diagnostic payloads are train-only.
                 "opd_diag_topk_overlap",

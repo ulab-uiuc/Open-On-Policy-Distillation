@@ -438,8 +438,37 @@ def apply_opd_kl_to_advantages(
         lp_s = student_topk_lp.detach() if stop_grad_weight else student_topk_lp
         return (p_s * (lp_s - teacher_topk_lp)).sum(dim=-1)
 
+    def _compute_topk_intersect_sg_norm_reverse_kl(
+        student_topk_lp: torch.Tensor,
+        teacher_topk_lp: torch.Tensor,
+        intersect_mask: torch.Tensor,
+        eps: float = 1e-8,
+    ) -> torch.Tensor:
+        # Reverse KL restricted to the intersection I of student/teacher top-k sets,
+        # with P_s and P_t renormalised on I to be valid distributions, then computed
+        # in the _sg style (stop-grad on log P̃_s so gradients flow only through the
+        # P̃_s weight).  Positions with empty intersection contribute zero.
+        mask = intersect_mask.to(dtype=student_topk_lp.dtype)
+        p_s = student_topk_lp.exp() * mask
+        p_t = teacher_topk_lp.exp() * mask
+        Z_s = p_s.sum(dim=-1, keepdim=True)
+        Z_t = p_t.sum(dim=-1, keepdim=True)
+        log_Z_s = Z_s.clamp(min=eps).log()
+        log_Z_t = Z_t.clamp(min=eps).log()
+        p_s_norm = p_s / Z_s.clamp(min=eps)
+        lp_s_norm = (student_topk_lp - log_Z_s).detach()
+        lp_t_norm = teacher_topk_lp - log_Z_t
+        kl = (p_s_norm * (lp_s_norm - lp_t_norm) * mask).sum(dim=-1)
+        valid = (mask.sum(dim=-1) > 0).to(dtype=kl.dtype)
+        return kl * valid
+
     _TOPK_KL_MODES = frozenset(
-        ["full_vocab_topk_reverse_kl", "topk_reverse_kl_notail", "topk_reverse_kl_notail_sg"]
+        [
+            "full_vocab_topk_reverse_kl",
+            "topk_reverse_kl_notail",
+            "topk_reverse_kl_notail_sg",
+            "topk_reverse_kl_intersect_sg_norm",
+        ]
     )
 
     reverse_kls = []
@@ -453,6 +482,14 @@ def apply_opd_kl_to_advantages(
             )
         student_topk = [t.to(device=device) for t in student_topk]
         teacher_topk = [t.to(device=device) for t in teacher_topk]
+        intersect_masks = None
+        if kl_mode == "topk_reverse_kl_intersect_sg_norm":
+            intersect_masks = rollout_data.get("opd_topk_intersect_mask")
+            if intersect_masks is None:
+                raise ValueError(
+                    f"OPD {kl_mode} requires opd_topk_intersect_mask in rollout_data."
+                )
+            intersect_masks = [m.to(device=device) for m in intersect_masks]
 
         topk_student_mass = []
         topk_teacher_mass = []
@@ -483,6 +520,16 @@ def apply_opd_kl_to_advantages(
                 topk_tail_kl.append(
                     reverse_kl - (student_topk[i].exp() * (student_topk[i] - teacher_topk[i])).sum(dim=-1)
                 )
+            elif kl_mode == "topk_reverse_kl_intersect_sg_norm":
+                reverse_kl = _compute_topk_intersect_sg_norm_reverse_kl(
+                    student_topk[i], teacher_topk[i], intersect_masks[i]
+                )
+                p_s = student_topk[i].exp()
+                p_s_mass = p_s.sum(dim=-1).clamp(min=0.0, max=1.0)
+                p_t_mass = teacher_topk[i].exp().sum(dim=-1).clamp(min=0.0, max=1.0)
+                topk_student_mass.append(p_s_mass)
+                topk_teacher_mass.append(p_t_mass)
+                topk_tail_kl.append(torch.zeros_like(reverse_kl))
             else:
                 stop_grad = kl_mode == "topk_reverse_kl_notail_sg"
                 reverse_kl = _compute_topk_notail_reverse_kl(student_topk[i], teacher_topk[i], stop_grad)
@@ -1393,11 +1440,20 @@ def policy_loss_function(
                 max_seq_lens,
             )
             opd_explicit_loss = opd_sum_of_sample_mean(opd_explicit_values)
-        elif kl_mode in ("full_vocab_topk_reverse_kl", "topk_reverse_kl_notail", "topk_reverse_kl_notail_sg"):
+        elif kl_mode in (
+            "full_vocab_topk_reverse_kl",
+            "topk_reverse_kl_notail",
+            "topk_reverse_kl_notail_sg",
+            "topk_reverse_kl_intersect_sg_norm",
+        ):
             if "opd_topk_token_ids" not in batch or "opd_topk_teacher_log_probs" not in batch:
                 raise ValueError(
                     f"OPD explicit {kl_mode} requires opd_topk_token_ids and "
                     "opd_topk_teacher_log_probs in batch."
+                )
+            if kl_mode == "topk_reverse_kl_intersect_sg_norm" and "opd_topk_intersect_mask" not in batch:
+                raise ValueError(
+                    f"OPD explicit {kl_mode} requires opd_topk_intersect_mask in batch."
                 )
 
             tp_group = mpu.get_tensor_model_parallel_group()
@@ -1460,6 +1516,26 @@ def policy_loss_function(
                     p_t_tail = (1.0 - p_t.sum(dim=-1)).clamp(min=eps)
                     kl_tail = p_s_tail * (p_s_tail.log() - p_t_tail.log())
                     per_sample_kl.append(kl_topk + kl_tail)
+                elif kl_mode == "topk_reverse_kl_intersect_sg_norm":
+                    intersect_mask_i = batch["opd_topk_intersect_mask"][i]
+                    if intersect_mask_i.shape != teacher_topk_lp_i.shape:
+                        raise ValueError(
+                            "OPD intersect mask shape mismatch vs teacher log-probs: "
+                            f"{intersect_mask_i.shape} vs {teacher_topk_lp_i.shape}."
+                        )
+                    mask = intersect_mask_i.to(dtype=current_student_lp.dtype, device=current_student_lp.device)
+                    p_s_masked = p_s * mask
+                    p_t_masked = teacher_topk_lp_i.exp() * mask
+                    Z_s = p_s_masked.sum(dim=-1, keepdim=True)
+                    Z_t = p_t_masked.sum(dim=-1, keepdim=True)
+                    log_Z_s = Z_s.clamp(min=eps).log()
+                    log_Z_t = Z_t.clamp(min=eps).log()
+                    p_s_norm = p_s_masked / Z_s.clamp(min=eps)
+                    lp_s_norm = (current_student_lp - log_Z_s).detach()
+                    lp_t_norm = teacher_topk_lp_i - log_Z_t
+                    kl_i = (p_s_norm * (lp_s_norm - lp_t_norm) * mask).sum(dim=-1)
+                    valid = (mask.sum(dim=-1) > 0).to(dtype=kl_i.dtype)
+                    per_sample_kl.append(kl_i * valid)
                 else:
                     # topk_reverse_kl_notail and topk_reverse_kl_notail_sg: no tail correction
                     # For _sg: stopgrad on log P_s so gradients flow only through P_s weight.

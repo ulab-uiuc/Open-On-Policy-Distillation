@@ -17,11 +17,11 @@
 #     --opd-kl-mode full_vocab_topk_reverse_kl --opd-topk 50
 
 OPD_KL_MODE="topk_reverse_kl_notail"
-OPD_TOPK="5"
+OPD_TOPK="20"
 OPD_EXPLICIT_LOSS_COEF="1.0"
 OPD_DISTILL_MAX_RESPONSE_LEN="${OPD_DISTILL_MAX_RESPONSE_LEN:-8192}"
 OPD_TOKEN_STATS="${OPD_TOKEN_STATS:-1}"
-OPD_TOKEN_STATS_TOPK="${OPD_TOKEN_STATS_TOPK:-5}"
+OPD_TOKEN_STATS_TOPK="${OPD_TOKEN_STATS_TOPK:-20}"
 OPD_TOKEN_STATS_REPEAT_NGRAM="${OPD_TOKEN_STATS_REPEAT_NGRAM:-3}"
 OPD_TOKEN_STATS_EOS_TOKEN_ID="${OPD_TOKEN_STATS_EOS_TOKEN_ID:-151645}"
 OPD_TEACHER_SFT="${OPD_TEACHER_SFT:-0}"
@@ -159,8 +159,8 @@ export PYTHONBUFFERED=16
 
 TEACHER_IP="0.0.0.0"
 TEACHER_PORT="${TEACHER_PORT:-30086}"
-TEACHER_MODEL_PATH="${TEACHER_MODEL_PATH:-output/Qwen3-1.7B_opsd_masked_grpo_dapo_hf}"
-TEACHER_CUDA_VISIBLE_DEVICES="${TEACHER_CUDA_VISIBLE_DEVICES:-0}"
+TEACHER_MODEL_PATH="${TEACHER_MODEL_PATH:-/root/checkpoints_siqi/Qwen3-1.7B_privileged_grpo_full_openthoughts_step99}"
+TEACHER_CUDA_VISIBLE_DEVICES="${TEACHER_CUDA_VISIBLE_DEVICES:-4}"
 TEACHER_MEM_FRACTION_STATIC="${TEACHER_MEM_FRACTION_STATIC:-0.70}"
 RM_MAX_CONCURRENCY="${RM_MAX_CONCURRENCY:-64}"
 TEACHER_LOG_FILE="/tmp/sglang_teacher_qwen3_8b_$(date +%s).log"
@@ -361,7 +361,7 @@ GRPO_ARGS=(
    --opd-explicit-loss-coef "${OPD_EXPLICIT_LOSS_COEF}"
    --opd-distill-max-response-len "${OPD_DISTILL_MAX_RESPONSE_LEN}"
    --opd-zero-task-reward
-   --opd-teacher-info-mode same_as_student
+   --opd-teacher-info-mode full
    --opd-teacher-tokenizer "${TEACHER_MODEL_PATH}"
    ${TEACHER_SFT_ARGS[@]}
    ${TOKEN_STATS_ARGS[@]}
@@ -381,7 +381,7 @@ OPTIMIZER_ARGS=(
 WANDB_ARGS=(
    --use-wandb
    --wandb-project slime-dev
-   --wandb-group qwen3-1.7B-1.7bgrpoteacher-opd-noanswer-dapo-grad_reversekl_top5
+   --wandb-group qwen3-1.7B-1.7bPIgrpoteacher-opd-noanswer-dapo-grad_reversekl_top20
    --wandb-key 2ed6f8544ac3e30d5c08879166cc10d9c6232448
 )
 
@@ -412,7 +412,7 @@ echo "Starting Ray job..."
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 unset RAY_ADDRESS
 ray stop --force || true
-export CUDA_VISIBLE_DEVICES=1,2,3
+export CUDA_VISIBLE_DEVICES=7,8,9
 ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 3 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
 
 set +e
@@ -423,7 +423,7 @@ ray job submit --submission-id "${RAY_JOB_ID}" --address="http://127.0.0.1:8265"
      "env_vars": {
         "PYTHONPATH": "/root/Megatron-LM/",
         "CUDA_DEVICE_MAX_CONNECTIONS": "1",
-        "CUDA_VISIBLE_DEVICES": "1,2,3"
+        "CUDA_VISIBLE_DEVICES": "7,8,9"
      }
    }' \
    -- python3 train.py \

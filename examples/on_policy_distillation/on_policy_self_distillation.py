@@ -36,6 +36,7 @@ Teacher information density modes (``--opsd-teacher-info-mode``):
 Exported symbols used via CLI args:
     --custom-rm-path examples.on_policy_distillation.on_policy_self_distillation.reward_func
     --custom-reward-post-process-path examples.on_policy_distillation.on_policy_self_distillation.post_process_rewards
+    --custom-reward-post-process-path examples.on_policy_distillation.on_policy_self_distillation.post_process_rewards_grpo_only
     --reward-key math_reward
 """
 
@@ -556,3 +557,48 @@ def post_process_rewards(args, samples, **kwargs):
         normalised_rewards = list(raw_rewards)
 
     return raw_rewards, normalised_rewards
+
+
+# ---------------------------------------------------------------------------
+# post_process_rewards_grpo_only
+# ---------------------------------------------------------------------------
+
+def post_process_rewards_grpo_only(args, samples, **kwargs):
+    """Pure GRPO reward post-processing: math reward + group normalisation, no teacher tokens.
+
+    Use this when privileged information is already baked into the rollout prompt
+    (e.g. via ``filter_openthoughts_math.py --privileged-mode``).  The rollout is
+    fully on-policy under the privileged prompt, so no token replacement or teacher
+    forward pass is needed here.
+
+    CLI wiring::
+
+        --custom-rm-path      examples.on_policy_distillation.on_policy_self_distillation.reward_func
+        --custom-reward-post-process-path \\
+            examples.on_policy_distillation.on_policy_self_distillation.post_process_rewards_grpo_only
+        --reward-key math_reward
+    """
+    raw_rewards = []
+    for sample in samples:
+        r = sample.get_reward_value(args)
+        if isinstance(r, dict):
+            r = r.get("math_reward", 0.0)
+        raw_rewards.append(float(r))
+
+    n = getattr(args, "n_samples_per_prompt", 1)
+    rewards_tensor = torch.tensor(raw_rewards, dtype=torch.float)
+
+    if n > 1 and len(raw_rewards) >= n:
+        rewards_tensor = rewards_tensor.view(-1, n)
+        mean = rewards_tensor.mean(dim=-1, keepdim=True)
+        std = rewards_tensor.std(dim=-1, keepdim=True)
+        normalised = (rewards_tensor - mean) / (std + 1e-6)
+        zero_std_mask = std.squeeze(-1) < 1e-8
+        normalised[zero_std_mask] = 0.0
+        normalised_rewards = normalised.flatten().tolist()
+    else:
+        normalised_rewards = list(raw_rewards)
+
+    return raw_rewards, normalised_rewards
+
+

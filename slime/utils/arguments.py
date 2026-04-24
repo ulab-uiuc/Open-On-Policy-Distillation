@@ -1001,6 +1001,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "full_vocab_topk_reverse_kl",
                     "topk_reverse_kl_notail",
                     "topk_reverse_kl_notail_sg",
+                    "topk_reverse_kl_intersect_sg_norm",
                 ],
                 default="token_reverse_kl",
                 help=(
@@ -1011,7 +1012,11 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "student top-k support and teacher log-probs on the same token set. "
                     "'topk_reverse_kl_notail': top-k reverse KL without tail-mass correction term. "
                     "'topk_reverse_kl_notail_sg': top-k reverse KL without tail mass, with stop-grad "
-                    "on the P_student weight (gradients flow only through log P_student)."
+                    "on the P_student weight (gradients flow only through log P_student). "
+                    "'topk_reverse_kl_intersect_sg_norm': restrict to the intersection of student and "
+                    "teacher top-k, renormalise P_s and P_t on the intersection to valid distributions, "
+                    "then compute reverse KL in the _sg style (stop-grad on log P̃_s). Empty-intersection "
+                    "positions contribute zero."
                 ),
             )
             parser.add_argument(
@@ -1095,13 +1100,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--opd-teacher-info-mode",
                 type=str,
-                choices=["same_as_student", "answer_only"],
+                choices=["same_as_student", "answer_only", "full"],
                 default="same_as_student",
                 help=(
                     "Teacher prompt mode for external-teacher OPD (mainly --opd-type=sglang). "
                     "'same_as_student' (default): teacher sees exactly the same prompt tokens as student. "
                     "'answer_only': teacher receives privileged answer-only hint appended to the student user prompt, "
-                    "following the OPSD answer_only construction."
+                    "following the OPSD answer_only construction. "
+                    "'full': teacher receives full privileged context "
+                    "(raw problem + reference solution + transition + format instruction), "
+                    "matching OPSD/privileged-GRPO full prompt construction."
                 ),
             )
             parser.add_argument(
@@ -2176,6 +2184,7 @@ def slime_validate_args(args):
                 "full_vocab_topk_reverse_kl",
                 "topk_reverse_kl_notail",
                 "topk_reverse_kl_notail_sg",
+                "topk_reverse_kl_intersect_sg_norm",
             ):
                 if getattr(args, "opd_topk", 0) <= 0:
                     raise ValueError("--opd-topk must be > 0 when using a top-k KL mode.")

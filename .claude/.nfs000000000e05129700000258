@@ -7,8 +7,7 @@
       "Bash(find:*)",
       "Bash(grep -r \"compute_pass_rate\\\\|n_samples_per_eval\\\\|pass_at\\\\|pass@\" /mnt/disk1_from_server2/siqizhu4/opsd_slime --include=*.py -n)",
       "Read(//root/checkpoints_siqi/**)",
-      "Read(//root/**)",
-      "Bash(python *)"
+      "Read(//root/**)"
     ]
   }
 }

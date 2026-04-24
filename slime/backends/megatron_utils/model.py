@@ -816,6 +816,7 @@ def train_one_step(
                 "opd_sft_sample_mask",
                 "opd_topk_token_ids",
                 "opd_topk_teacher_log_probs",
+                "opd_topk_intersect_mask",
                 "opd_diag_topk_overlap",
                 "opd_diag_teacher_rank_at_k",
 

@@ -16,7 +16,7 @@
 #   bash examples/on_policy_distillation/run-qwen3-1.7B-8b-opd_noanswer_dapo.sh \
 #     --opd-kl-mode full_vocab_topk_reverse_kl --opd-topk 50
 
-OPD_KL_MODE="topk_reverse_kl_notail"
+OPD_KL_MODE="topk_reverse_kl_notail_sg"
 OPD_TOPK="5"
 OPD_EXPLICIT_LOSS_COEF="1.0"
 OPD_DISTILL_MAX_RESPONSE_LEN="${OPD_DISTILL_MAX_RESPONSE_LEN:-8192}"
@@ -381,7 +381,7 @@ OPTIMIZER_ARGS=(
 WANDB_ARGS=(
    --use-wandb
    --wandb-project slime-dev
-   --wandb-group qwen3-1.7B-1.7bgrpoteacher-opd-noanswer-dapo-grad_reversekl_top5
+   --wandb-group qwen3-1.7B-1.7bgrpoteacher-opd-noanswer-dapo-nograd_reversekl_top5
    --wandb-key 2ed6f8544ac3e30d5c08879166cc10d9c6232448
 )
 

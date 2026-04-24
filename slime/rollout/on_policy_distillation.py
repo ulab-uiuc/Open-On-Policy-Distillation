@@ -36,6 +36,12 @@ _ANSWER_ONLY_PROMPT = (
     "Now solve the problem yourself step by step and arrive at the same answer:"
 )
 
+_FULL_TRANSITION_PROMPT = (
+    "After understanding the reference solution and the rationale behind each step, "
+    "now articulate your own step-by-step reasoning that derives the same final answer "
+    "to the problem above:"
+)
+
 
 def _first_nonempty_text(*values) -> str:
     for v in values:
@@ -116,6 +122,7 @@ def _build_teacher_user_content(args, sample: Sample) -> str:
     mode = getattr(args, "opd_teacher_info_mode", "same_as_student")
     metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
     raw_content = _first_nonempty_text(metadata.get("raw_content"))
+    raw_problem = _first_nonempty_text(metadata.get("raw_problem"), raw_content)
     student_user_content = _first_nonempty_text(
         metadata.get("student_user_content"),
         raw_content,
@@ -123,6 +130,27 @@ def _build_teacher_user_content(args, sample: Sample) -> str:
     )
 
     if mode == "same_as_student":
+        return student_user_content
+
+    if mode == "full":
+        reference_solution = _first_nonempty_text(
+            metadata.get("reference_solution"),
+            metadata.get("solution"),
+        )
+        format_instruction = _first_nonempty_text(metadata.get("format_instruction"))
+        if reference_solution:
+            if format_instruction:
+                return (
+                    f"{raw_problem}\n\n"
+                    f"Here is a reference solution to this problem:\n{reference_solution}\n"
+                    f"{_FULL_TRANSITION_PROMPT}\n"
+                    f"{format_instruction}"
+                )
+            return (
+                f"{raw_problem}\n\n"
+                f"Here is a reference solution to this problem:\n{reference_solution}\n"
+                f"{_FULL_TRANSITION_PROMPT}"
+            )
         return student_user_content
 
     if mode != "answer_only":
@@ -668,7 +696,10 @@ async def reward_func(args, sample, **kwargs):
     response_start = max(len(teacher_input_ids) - response_len, 0)
     use_opd_sglang = getattr(args, "use_opd", False) and getattr(args, "opd_type", None) == "sglang"
     use_topk_kl = use_opd_sglang and getattr(args, "opd_kl_mode", "token_reverse_kl") in (
-        "full_vocab_topk_reverse_kl", "topk_reverse_kl_notail", "topk_reverse_kl_notail_sg"
+        "full_vocab_topk_reverse_kl",
+        "topk_reverse_kl_notail",
+        "topk_reverse_kl_notail_sg",
+        "topk_reverse_kl_intersect_sg_norm",
     )
     diag_enabled = use_opd_sglang and bool(getattr(args, "opd_token_stats", False))
     diag_topk = int(getattr(args, "opd_token_stats_topk", 50))
@@ -757,6 +788,7 @@ async def reward_func(args, sample, **kwargs):
         teacher_output = await _post_with_sem(payload)
 
     teacher_topk_log_probs = None
+    teacher_topk_intersect_mask = None
     teacher_topk_token_ids = None
     if use_topk_kl or diag_enabled:
         input_items = teacher_output.get("meta_info", {}).get("input_token_logprobs")
@@ -783,14 +815,24 @@ async def reward_func(args, sample, **kwargs):
             # token IDs. Tokens absent from teacher's top-k are filled with the
             # student's own rollout logprob, making that term zero in the KL loss
             # (effectively masking the token rather than penalising it).
+            # Also emit a 0/1 intersect mask (student-topk ∩ teacher-topk) for
+            # the topk_reverse_kl_intersect_sg_norm mode.
             teacher_topk_log_probs = []
+            teacher_topk_intersect_mask = []
             for pos, tok_ids in enumerate(requested_topk_token_ids):
                 m = teacher_top_logprob_maps[pos] if pos < len(teacher_top_logprob_maps) else {}
-                teacher_topk_log_probs.append([
-                    float(m[int(t)]) if int(t) in m
-                    else float(topk_student_lp[pos][j])
-                    for j, t in enumerate(tok_ids)
-                ])
+                row_lp = []
+                row_mask = []
+                for j, t in enumerate(tok_ids):
+                    ti = int(t)
+                    if ti in m:
+                        row_lp.append(float(m[ti]))
+                        row_mask.append(1)
+                    else:
+                        row_lp.append(float(topk_student_lp[pos][j]))
+                        row_mask.append(0)
+                teacher_topk_log_probs.append(row_lp)
+                teacher_topk_intersect_mask.append(row_mask)
         if diag_enabled:
             teacher_topk_token_ids = _extract_teacher_topk_token_ids(
                 teacher_top_logprob_maps,
@@ -820,6 +862,7 @@ async def reward_func(args, sample, **kwargs):
         "teacher_input_len": len(teacher_input_ids),
         "teacher_response_start": response_start,
         "teacher_topk_log_probs": teacher_topk_log_probs,
+        "teacher_topk_intersect_mask": teacher_topk_intersect_mask,
         "teacher_topk_token_ids": teacher_topk_token_ids,
         "teacher_sft_output": teacher_sft_output,
         "teacher_sft_prompt_input_ids": teacher_prompt_input_ids if teacher_sft_output is not None else None,
@@ -865,6 +908,7 @@ def post_process_rewards(args, samples: list[Sample], **kwargs):
     teacher_input_lens = []
     teacher_response_starts = []
     teacher_topk_logprobs_list = []
+    teacher_topk_intersect_list = []
     teacher_topk_token_ids_list = []
     teacher_sft_outputs = []
     teacher_sft_prompt_input_ids = []
@@ -878,6 +922,7 @@ def post_process_rewards(args, samples: list[Sample], **kwargs):
                 int(reward.get("teacher_response_start", max(len(sample.tokens) - sample.response_length, 0)))
             )
             teacher_topk_logprobs_list.append(reward.get("teacher_topk_log_probs"))
+            teacher_topk_intersect_list.append(reward.get("teacher_topk_intersect_mask"))
             teacher_topk_token_ids_list.append(reward.get("teacher_topk_token_ids"))
             teacher_sft_outputs.append(reward.get("teacher_sft_output"))
             teacher_sft_prompt_input_ids.append(reward.get("teacher_sft_prompt_input_ids"))
@@ -888,6 +933,7 @@ def post_process_rewards(args, samples: list[Sample], **kwargs):
             teacher_input_lens.append(len(sample.tokens))
             teacher_response_starts.append(max(len(sample.tokens) - sample.response_length, 0))
             teacher_topk_logprobs_list.append(None)
+            teacher_topk_intersect_list.append(None)
             teacher_topk_token_ids_list.append(None)
             teacher_sft_outputs.append(None)
             teacher_sft_prompt_input_ids.append(None)
@@ -917,12 +963,18 @@ def post_process_rewards(args, samples: list[Sample], **kwargs):
         getattr(args, "use_opd", False)
         and getattr(args, "opd_type", None) == "sglang"
         and getattr(args, "opd_kl_mode", "token_reverse_kl") in (
-            "full_vocab_topk_reverse_kl", "topk_reverse_kl_notail", "topk_reverse_kl_notail_sg"
+            "full_vocab_topk_reverse_kl",
+            "topk_reverse_kl_notail",
+            "topk_reverse_kl_notail_sg",
+            "topk_reverse_kl_intersect_sg_norm",
         )
     )
+    need_intersect_mask = use_topk_kl and getattr(args, "opd_kl_mode", "token_reverse_kl") == (
+        "topk_reverse_kl_intersect_sg_norm"
+    )
     if use_topk_kl:
-        for idx, (sample, teacher_topk) in enumerate(
-            zip(original_samples, teacher_topk_logprobs_list, strict=False)
+        for idx, (sample, teacher_topk, intersect_mask) in enumerate(
+            zip(original_samples, teacher_topk_logprobs_list, teacher_topk_intersect_list, strict=False)
         ):
             student_topk = getattr(sample, "opd_topk_student_log_probs", None)
             if student_topk is None or teacher_topk is None:
@@ -936,6 +988,17 @@ def post_process_rewards(args, samples: list[Sample], **kwargs):
                 )
             sample.opd_topk_student_log_probs = torch.tensor(student_topk, dtype=torch.float32)
             sample.opd_topk_teacher_log_probs = torch.tensor(teacher_topk, dtype=torch.float32)
+            if need_intersect_mask:
+                if intersect_mask is None:
+                    raise ValueError(
+                        f"Sample {idx}: missing teacher_topk_intersect_mask for topk_reverse_kl_intersect_sg_norm."
+                    )
+                if len(intersect_mask) != sample.response_length:
+                    raise ValueError(
+                        f"Sample {idx}: intersect_mask length mismatch: "
+                        f"{len(intersect_mask)} vs response={sample.response_length}."
+                    )
+                sample.opd_topk_intersect_mask = torch.tensor(intersect_mask, dtype=torch.int)
 
     if diag_enabled:
         for idx, (sample, teacher_topk_ids) in enumerate(
@@ -1015,6 +1078,11 @@ def post_process_rewards(args, samples: list[Sample], **kwargs):
             sft_sample.opd_topk_teacher_log_probs = (
                 [[] for _ in range(sft_sample.response_length)]
                 if getattr(sample, "opd_topk_teacher_log_probs", None) is not None
+                else None
+            )
+            sft_sample.opd_topk_intersect_mask = (
+                [[] for _ in range(sft_sample.response_length)]
+                if getattr(sample, "opd_topk_intersect_mask", None) is not None
                 else None
             )
             sft_sample.opd_diag_student_topk_token_ids = None

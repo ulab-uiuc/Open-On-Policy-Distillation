@@ -35,6 +35,10 @@ class Sample:
     opd_topk_token_ids: list[list[int]] | None = None
     opd_topk_student_log_probs: list[list[float]] | None = None
     opd_topk_teacher_log_probs: list[list[float]] | None = None
+    # Per-position 0/1 mask indicating whether each student-topk token is also in
+    # the teacher's top-k (i.e., intersection of student and teacher top-k sets).
+    # Used by topk_reverse_kl_intersect_sg_norm to restrict KL to the intersection.
+    opd_topk_intersect_mask: list[list[int]] | None = None
     # Optional OPD/OPSD token-diagnostic payloads.
     opd_diag_student_topk_token_ids: list[list[int]] | None = None
     opd_diag_topk_overlap: list[float] | None = None
